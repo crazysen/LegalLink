@@ -1,0 +1,24 @@
+Apply these edits in github.com/rxasrn/april_13_new (branch april_13) src/App.js
+so the browser URL reflects the same `page` ids used by the mobile deep links.
+
+1) Add constant:
+   const HASH_PAGE_PREFIX = 'batasmo-page-';
+
+2) Inside handleNavigate (after setPage(nextPage)), sync hash:
+   try {
+     const next = nextPage && !CLIENT_NOTARY_BLOCKED_PAGES.has(nextPage)
+       ? `${HASH_PAGE_PREFIX}${nextPage}`
+       : '';
+     const { pathname, search } = window.location;
+     if (next) window.history.replaceState(null, '', `${pathname}${search}#${next}`);
+     else window.history.replaceState(null, '', `${pathname}${search}`);
+   } catch (_) {}
+
+3) Extend resolveInitialPage() to parse hash after pathname checks:
+   const hash = String(window.location?.hash || '').replace(/^#/, '');
+   if (hash.startsWith(HASH_PAGE_PREFIX)) {
+     return hash.slice(HASH_PAGE_PREFIX.length);
+   }
+
+4) After bootstrap auth loads profile, if hash indicates a page the user can access,
+   setPage (respect canAccessPage) for logged-in users.

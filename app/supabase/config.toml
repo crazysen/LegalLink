@@ -1,0 +1,11 @@
+# Auth Send SMS hook calls this function with Standard Webhooks signing, not a user JWT.
+# https://supabase.com/docs/guides/functions/function-configuration
+[functions.send-sms-hook]
+verify_jwt = false
+
+# SMS OTP expiry (GoTrue default: 60s) is NOT configurable in config.toml.
+# Change it in Supabase Dashboard → Authentication → Rate Limits → SMS OTP Expiry,
+# or via Management API:
+#   curl -X PATCH "https://api.supabase.com/v1/projects/<ref>/config/auth" \
+#     -H "Authorization: Bearer <access_token>" \
+#     -d '{"sms_otp_exp": 300}'
