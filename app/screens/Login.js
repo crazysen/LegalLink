@@ -15,6 +15,12 @@ import {useUserProfile} from '../context/UserProfileContext';
 import {signInWithEmail, checkEmailLockout} from '../services/authService';
 import {getMyProfile} from '../services/profileService';
 import {IS_IOS} from '../constants/platformUi';
+import {
+  formatLockoutMessage,
+  isValidEmail,
+  mapLoginErrorMessage,
+  VALID_EMAIL_MESSAGE,
+} from '../utils/validators';
 
 const colors = {
   navy: '#0F1E36',
@@ -112,12 +118,13 @@ export default function Login({navigation}) {
   };
 
   const handleLogin = async () => {
-    if (!email) return Alert.alert('Error', 'Email is required');
-    if (!email.includes('@') || !email.includes('.')) {
-      return Alert.alert('Error', 'Enter valid email');
+    if (!email.trim() || !(passwordForSignInRef.current || password)) {
+      return Alert.alert('Error', 'Email and password are required.');
+    }
+    if (!isValidEmail(email.trim())) {
+      return Alert.alert('Error', VALID_EMAIL_MESSAGE);
     }
     const passwordToUse = passwordForSignInRef.current || password;
-    if (!passwordToUse) return Alert.alert('Error', 'Password is required');
 
     try {
       setIsSubmitting(true);
@@ -131,14 +138,25 @@ export default function Login({navigation}) {
 
       const roleFromApi = user?.role;
       const fullNameFromApi = user?.name;
+      const roleLower = String(roleFromApi || '').toLowerCase();
       const normalizedRole =
-        String(roleFromApi || '').toLowerCase() === 'attorney'
+        roleLower === 'attorney'
           ? 'Attorney'
-          : String(roleFromApi || '').toLowerCase() === 'client'
-            ? 'Client'
-          : isClient
-            ? 'Client'
-            : 'Attorney';
+          : roleLower === 'admin'
+            ? 'Admin'
+            : roleLower === 'client'
+              ? 'Client'
+              : isClient
+                ? 'Client'
+                : 'Attorney';
+
+      if (normalizedRole === 'Admin') {
+        Alert.alert(
+          'Admin sign-in',
+          'Admin tools (reschedule approvals, dashboard) are available on the LegalLink web app. Use the same email and password there.',
+        );
+        return;
+      }
 
       if (data?.needsPhoneVerification) {
         if (!data.phoneE164ForVerification) {
@@ -150,7 +168,7 @@ export default function Login({navigation}) {
         }
         updateProfile({
           email: user?.email ?? email.trim(),
-          name: fullNameFromApi ?? 'BatasMo User',
+          name: fullNameFromApi ?? 'LegalLink User',
           phone: user?.phone ?? '',
           address: user?.address ?? '',
           role: normalizedRole,
@@ -167,17 +185,21 @@ export default function Login({navigation}) {
 
       updateProfile({
         email: user?.email ?? email.trim(),
-        name: fullNameFromApi ?? 'BatasMo User',
+        name: fullNameFromApi ?? 'LegalLink User',
         phone: user?.phone ?? '',
         address: user?.address ?? '',
         role: normalizedRole,
       });
 
-      if (normalizedRole === 'Client') {
-        navigation.navigate('HomepageClient');
-      } else {
-        navigation.navigate('AttyLandingPage');
-      }
+      navigation.reset({
+        index: 0,
+        routes: [
+          {
+            name:
+              normalizedRole === 'Client' ? 'HomepageClient' : 'AttyLandingPage',
+          },
+        ],
+      });
     } catch (error) {
       const message = error?.message ?? 'Unable to sign in.';
       const normalized = message.toLowerCase();
@@ -195,24 +217,14 @@ export default function Login({navigation}) {
 
       if (error?.message?.startsWith('LOCKOUT:')) {
         const timeRemaining = parseInt(error.message.split(':')[1], 10);
-        setLockoutSeconds(timeRemaining);
+        const safeSeconds = Number.isFinite(timeRemaining) && timeRemaining > 0 ? timeRemaining : 0;
+        setLockoutSeconds(safeSeconds);
         setLockedEmail(email.trim().toLowerCase());
-        const mins = Math.max(1, Math.ceil(timeRemaining / 60));
-        Alert.alert(
-          'Too many attempts',
-          `Try again in about ${mins} minute${mins === 1 ? '' : 's'}. An admin can clear failed logins in Supabase. For local testing only, add EXPO_PUBLIC_SKIP_LOGIN_LOCKOUT=1 to .env and restart Expo.`,
-        );
+        Alert.alert('Account locked', formatLockoutMessage(safeSeconds));
         return;
       }
 
-      if (normalized.includes('account locked')) {
-        setLockoutSeconds(15 * 60);
-        setLockedEmail(email.trim().toLowerCase());
-        Alert.alert('Login Failed', error?.message ?? 'Account locked due to 3 consecutive failed login attempts.');
-        return;
-      }
-
-      Alert.alert('Login Failed', error?.message ?? 'Unable to sign in.');
+      Alert.alert('Login Failed', mapLoginErrorMessage(error));
     } finally {
       setIsSubmitting(false);
     }
@@ -228,7 +240,7 @@ export default function Login({navigation}) {
         contentContainerStyle={styles.scrollContent}>
         <View style={styles.heroSection}>
           <View style={styles.heroBadge}>
-            <Text style={styles.heroBadgeText}>BATASMO SECURE PORTAL</Text>
+            <Text style={styles.heroBadgeText}>LEGALLINK SECURE PORTAL</Text>
           </View>
           <Text style={styles.title}>Welcome Back</Text>
           <Text style={styles.subtitle}>Access your secure legal portal.</Text>

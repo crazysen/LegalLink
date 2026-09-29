@@ -11,12 +11,28 @@ import { ClientScreenShell, ClientFadeInSoft } from '../components/ClientScreenS
 export default function PaymentSuccessful({navigation, route}) {
   const amount = route?.params?.amount || '₱2,500.00';
   const transactionId = route?.params?.transactionId || 'BTMS-UNKNOWN';
+  const paymentContext = route?.params?.paymentContext || null;
+  // Determine if the user already bundled a notarial request
+  const includeNotarial =
+    Boolean(paymentContext?.payload?.includeNotarial) ||
+    paymentContext?.sourceType === 'notarial';
 
   const handleBackToDashboard = () => {
     navigation.reset({
       index: 0,
       routes: [{name: 'HomepageClient'}],
     });
+  };
+
+  const handleGoToNotarial = () => {
+    navigation.reset({
+      index: 0,
+      routes: [{name: 'HomepageClient'}],
+    });
+    // Defer navigation to avoid reset race
+    setTimeout(() => {
+      navigation.navigate('ClientNotarial');
+    }, 100);
   };
 
   return (
@@ -44,6 +60,40 @@ export default function PaymentSuccessful({navigation, route}) {
           A digital receipt has been sent to your email and is available in your 
           <Text style={styles.boldText}> Documents vault</Text>.
         </Text>
+
+        {/* ── Combined booking badge (shown when notarial was bundled) ── */}
+        {includeNotarial ? (
+          <View style={styles.notarialBadge}>
+            <Text style={styles.notarialBadgeIcon}>📄</Text>
+            <View style={styles.notarialBadgeTextGroup}>
+              <Text style={styles.notarialBadgeTitle}>
+                Notarial Request Submitted
+              </Text>
+              <Text style={styles.notarialBadgeHint}>
+                Your notarization request has been bundled with this booking.
+                Track it under Menu → Notary Status.
+              </Text>
+            </View>
+          </View>
+        ) : (
+          /* ── Nudge banner for standalone booking (Directive 5) ── */
+          <View style={styles.notarialNudge}>
+            <Text style={styles.notarialNudgeTitle}>
+              📋 Also need a document notarized?
+            </Text>
+            <Text style={styles.notarialNudgeHint}>
+              Submit a notarial service request and have it handled by your attorney.
+            </Text>
+            <TouchableOpacity
+              style={styles.notarialNudgeBtn}
+              onPress={handleGoToNotarial}
+              activeOpacity={0.85}>
+              <Text style={styles.notarialNudgeBtnText}>
+                Request Notary Service →
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
 
         <TouchableOpacity style={styles.dashboardButton} onPress={handleBackToDashboard}>
           <Text style={styles.buttonText}>Go back to dashboard</Text>
@@ -169,5 +219,72 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     fontSize: 16,
   },
+
+  // ── Notarial nudge banner — standalone booking (Directive 5) ──────────────
+  notarialNudge: {
+    width: '100%',
+    backgroundColor: 'rgba(244, 215, 139, 0.07)',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.25)',
+    padding: 18,
+    marginBottom: 20,
+    alignItems: 'center',
+  },
+  notarialNudgeTitle: {
+    color: T.gold[0],
+    fontWeight: '700',
+    fontSize: 14,
+    textAlign: 'center',
+    marginBottom: 6,
+  },
+  notarialNudgeHint: {
+    color: T.textSoft,
+    fontSize: 12,
+    textAlign: 'center',
+    lineHeight: 18,
+    marginBottom: 14,
+  },
+  notarialNudgeBtn: {
+    backgroundColor: 'rgba(244, 215, 139, 0.15)',
+    borderWidth: 1,
+    borderColor: T.gold[0],
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+  },
+  notarialNudgeBtnText: {
+    color: T.gold[0],
+    fontWeight: '700',
+    fontSize: 13,
+  },
+
+  // ── Combined booking confirmation badge ──────────────────────────────────
+  notarialBadge: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(16, 185, 129, 0.3)',
+    padding: 16,
+    marginBottom: 20,
+  },
+  notarialBadgeIcon: { fontSize: 22 },
+  notarialBadgeTextGroup: { flex: 1 },
+  notarialBadgeTitle: {
+    color: '#6EE7B7',
+    fontWeight: '700',
+    fontSize: 13,
+    marginBottom: 4,
+  },
+  notarialBadgeHint: {
+    color: T.textSoft,
+    fontSize: 12,
+    lineHeight: 17,
+  },
 });
+
 

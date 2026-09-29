@@ -7,6 +7,7 @@ import React, {
   useState,
 } from 'react';
 import {supabase} from '../services/supabaseClient';
+import {parseNotificationImageUrl} from '../services/announcementImages';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Context definition
@@ -15,7 +16,7 @@ import {supabase} from '../services/supabaseClient';
 const NotificationContext = createContext({
   notifications: [],
   unreadCount: 0,
-  toast: null,           // { id, title, body } | null
+  toast: null,           // normalized notification row | null
   dismissToast: () => {},
   markAllRead: () => {},
   markRead: (_id) => {},
@@ -24,6 +25,18 @@ const NotificationContext = createContext({
 
 export function useNotifications() {
   return useContext(NotificationContext);
+}
+
+function normalizeNotificationRow(item) {
+  if (!item) return item;
+  const payload = item.data && typeof item.data === 'object' ? item.data : {};
+  const appointmentId =
+    payload.appointment_id || payload.appointmentId || payload.appointment || null;
+  return {
+    ...item,
+    appointmentId: appointmentId ? String(appointmentId) : null,
+    imageUrl: parseNotificationImageUrl(payload),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -39,7 +52,7 @@ export function NotificationProvider({children}) {
 
   // ── helpers ───────────────────────────────────────────────────────────────
   const showToast = useCallback((notif) => {
-    setToast({id: notif.id, title: notif.title, body: notif.body});
+    setToast(notif);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToast(null), 5000);
   }, []);
@@ -60,7 +73,7 @@ export function NotificationProvider({children}) {
       .limit(50);
 
     if (!error && data) {
-      setNotifications(data);
+      setNotifications((data || []).map(normalizeNotificationRow));
     }
   }, []);
 
@@ -109,11 +122,9 @@ export function NotificationProvider({children}) {
             filter: `user_id=eq.${userId}`,
           },
           (payload) => {
-            const newNotif = payload.new;
+            const newNotif = normalizeNotificationRow(payload.new);
             if (!newNotif) return;
-            // Prepend to list
             setNotifications(prev => [newNotif, ...prev]);
-            // Trigger in-app toast
             showToast(newNotif);
           },
         )
@@ -128,8 +139,9 @@ export function NotificationProvider({children}) {
           (payload) => {
             const updated = payload.new;
             if (!updated) return;
+            const normalized = normalizeNotificationRow(updated);
             setNotifications(prev =>
-              prev.map(n => (n.id === updated.id ? {...n, ...updated} : n)),
+              prev.map(n => (n.id === normalized.id ? {...n, ...normalized} : n)),
             );
           },
         )

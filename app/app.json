@@ -1,25 +1,36 @@
 {
   "expo": {
-    "name": "BatasMoApp",
-    "slug": "BatasMoApp",
+    "name": "LegalLink",
+    "slug": "legallink",
     "version": "1.0.0",
     "orientation": "portrait",
+    "updates": {
+      "enabled": false,
+      "checkAutomatically": "NEVER",
+      "fallbackToCacheTimeout": 0
+    },
     "backgroundColor": "#04070B",
     "androidNavigationBar": {
       "barStyle": "light-content",
       "backgroundColor": "#04070B"
     },
     "icon": "./assets/images/icon.png",
-    "scheme": "batasmoapp",
+    "scheme": "legallinkapp",
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.batasmo.app"
+      "bundleIdentifier": "com.legallink.app"
     },
     "android": {
-      "package": "com.batasmo.app",
+      "package": "com.legallink.app",
+      "versionCode": 1,
       "usesCleartextTraffic": true,
       "softwareKeyboardLayoutMode": "pan",
+      "permissions": [
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.CAMERA"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -35,10 +46,18 @@
     },
     "plugins": [
       [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow LegalLink to use your camera for identity verification and video consultations.",
+          "microphonePermission": "Allow LegalLink to use your microphone for identity verification and video consultations.",
+          "recordAudioAndroid": true
+        }
+      ],
+      [
         "@videosdk.live/expo-config-plugin",
         {
-          "cameraPermission": "Allow BatasMo to use your camera for video consultations.",
-          "microphonePermission": "Allow BatasMo to use your microphone for video consultations."
+          "cameraPermission": "Allow LegalLink to use your camera for video consultations.",
+          "microphonePermission": "Allow LegalLink to use your microphone for video consultations."
         }
       ],
       [
@@ -58,6 +77,11 @@
     ],
     "experiments": {
       "reactCompiler": false
+    },
+    "extra": {
+      "eas": {
+        "projectId": "1436cc79-6e3f-4863-a652-f442d4b78d54"
+      }
     }
   }
 }

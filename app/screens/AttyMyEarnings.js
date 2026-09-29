@@ -284,7 +284,7 @@ export default function MyEarnings({navigation}) {
             />
             <View style={styles.headerTitles}>
               <Text style={styles.title}>Earnings</Text>
-              <Text style={styles.networkSub}>BATASMO PROFESSIONAL NETWORK</Text>
+              <Text style={styles.networkSub}>LEGALLINK PROFESSIONAL NETWORK</Text>
             </View>
           </View>
 

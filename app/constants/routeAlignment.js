@@ -21,11 +21,12 @@ const CLIENT_WEB_TO_SCREEN = {
   announcements: 'ClientNotification',
   'transaction-history': 'TransactionHistory',
   'client-logs': 'ClientConsultationLogs',
+  'client-notary-tracking': 'ClientNotaryStatus',
 };
 
 const ATTORNEY_WEB_TO_SCREEN = {
   'attorney-home': 'AttyLandingPage',
-  'consultation-requests': 'AttyMyAppointments',
+  'consultation-requests': 'AttyConsultationRequests',
   'upcoming-appointments': 'AttyMyAppointments',
   'manage-availability': 'AttyAvailabilityManager',
   'attorney-logs': 'AttorneyConsultationLogs',
@@ -209,15 +210,17 @@ export function resolveNavigationTargetFromPath(path, originalUrl = '', roleHint
   return null;
 }
 
-/** Menu rows for ClientMenu — same destinations as web ClientShell + extras (notary omitted from deep links only). */
+/**
+ * Menu rows for ClientMenu — same labels and order as web ClientShell MENU_ITEMS.
+ * My Appointments and Notarial Requests are reached from the dashboard, matching web.
+ */
 export const CLIENT_MENU_WEB_ROUTES = [
   {label: 'Dashboard', webPage: 'home-logged', route: 'HomepageClient'},
-  {label: 'Book Appointment', webPage: 'book-appointment', route: 'BookAppointment'},
+  {label: 'Book Consultation', webPage: 'book-appointment', route: 'BookAppointment'},
+  {label: 'Notary Status', webPage: 'client-notary-tracking', route: 'ClientNotaryStatus'},
   {label: 'Messages', webPage: 'support-messages', route: 'ClientSupportMessages'},
-  {label: 'My Appointments', webPage: 'my-appointments', route: 'MyAppointments'},
-  {label: 'Logs', webPage: 'client-logs', route: 'ClientConsultationLogs'},
-  {label: 'Notarial Requests', webPage: 'notarial-request', route: 'ClientNotarial'},
-  {label: 'Announcements', webPage: 'announcements', route: 'ClientNotification'},
+  {label: 'Announcement', webPage: 'announcements', route: 'ClientNotification'},
   {label: 'Transaction History', webPage: 'transaction-history', route: 'TransactionHistory'},
+  {label: 'Logs', webPage: 'client-logs', route: 'ClientConsultationLogs'},
   {label: 'Profile', webPage: 'profile', route: 'ProfileSettingsClient'},
 ];

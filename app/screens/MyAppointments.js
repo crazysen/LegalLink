@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import {
   ActivityIndicator,
@@ -7,28 +7,33 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { IS_ANDROID, IS_IOS } from '../constants/platformUi';
 import { REFERENCE_THEME as T } from '../constants/referenceTheme';
+import { DEFAULT_PAYMENT_METHOD } from '../constants/paymentConfig';
+import { warmPaymentBackend } from '../services/paymentApiClient';
 import {
-  formatAppointmentNotesForDisplay,
+  getAvailability,
   getEffectiveAppointmentStatus,
-  getMyAppointments,
-  isAppointmentCompleted,
+  invalidateAppointmentsCache,
+  normalizeSlotTimeLabel,
   parseAppointmentScheduleMs,
 } from '../services/appointmentService';
+import {
+  ensureAppConfigLoaded,
+  fetchClientConsultationQueue,
+  parseReschedulePendingFromNotes,
+  rescheduleClientAppointment,
+  subscribeToClientAppointments,
+} from '../services/userApi';
+import { getMyProfile } from '../services/profileService';
+import ClientConsultationQueue from '../components/ClientConsultationQueue';
 import { ClientScreenShell, ClientFadeIn } from '../components/ClientScreenShell';
 import ClientChevronBack from '../components/ClientChevronBack';
-
-function resolveScheduleValue(item) {
-  return (
-    item?.scheduled_at ||
-    item?.updated_at ||
-    item?.created_at ||
-    null
-  );
-}
 
 function formatDateTime(isoDateTime) {
   if (!isoDateTime) {
@@ -40,9 +45,7 @@ function formatDateTime(isoDateTime) {
 
   let value;
   if (hasTimezoneInfo) {
-    const normalizedValue = rawValue
-      .replace(' ', 'T')
-      .replace(/\+00$/, 'Z');
+    const normalizedValue = rawValue.replace(' ', 'T').replace(/\+00$/, 'Z');
     value = new Date(normalizedValue);
   } else {
     const localMatch = rawValue.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
@@ -52,7 +55,7 @@ function formatDateTime(isoDateTime) {
         Number(localMatch[2]) - 1,
         Number(localMatch[3]),
         Number(localMatch[4]),
-        Number(localMatch[5])
+        Number(localMatch[5]),
       );
     } else {
       value = new Date(rawValue);
@@ -75,32 +78,154 @@ function formatAttorneyName(name) {
     .trim();
 }
 
+function queueItemToAppointment(item) {
+  return {
+    id: item.id,
+    status: item.status,
+    scheduled_at: item.scheduledAt || item.date,
+    slot_date: item.slotDate,
+    slot_time: item.slotTime,
+    amount: item.amount,
+    payment_is_paid: item.payment_is_paid ?? item.payment === 'Paid',
+    attorney_name: item.name,
+    title: item.area,
+    notes: item.notes,
+    attorney_id: item.attorney_id,
+  };
+}
+
 function buildRescheduleDraft(appointment, dateLabel, timeLabel) {
   const attorneyName = formatAttorneyName(appointment?.attorney_name);
   const dateText = dateLabel && dateLabel !== 'No schedule' ? ` on ${dateLabel}` : '';
   const timeText = timeLabel && timeLabel !== '--:--' ? ` at ${timeLabel}` : '';
   return (
-    `Hi BatasMo Admin, I'd like to request a reschedule for my consultation` +
+    `Hi LegalLink Admin, I'd like to request a reschedule for my consultation` +
     `${attorneyName ? ` with Atty. ${attorneyName}` : ''}` +
     `${dateText}${timeText}. Please help me set a new schedule. Thank you!`
   );
 }
 
 export default function MyAppointments({ navigation }) {
-  const [appointments, setAppointments] = useState([]);
+  const [queueItems, setQueueItems] = useState([]);
+  const [clientId, setClientId] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [payModalVisible, setPayModalVisible] = useState(false);
-  const [pendingPayAppointment, setPendingPayAppointment] = useState(null);
-  const [selectedPayMethod, setSelectedPayMethod] = useState('gcash');
+  const [rescheduleModalVisible, setRescheduleModalVisible] = useState(false);
+  const [rescheduleTarget, setRescheduleTarget] = useState(null);
+  const [rescheduleDate, setRescheduleDate] = useState(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() + 1);
+    return d;
+  });
+  const [rescheduleTime, setRescheduleTime] = useState('');
+  const [rescheduleReason, setRescheduleReason] = useState('');
+  const [rescheduleSlots, setRescheduleSlots] = useState([]);
+  const [rescheduleSlotsLoading, setRescheduleSlotsLoading] = useState(false);
+  const [rescheduleSubmitting, setRescheduleSubmitting] = useState(false);
+  const [rescheduleError, setRescheduleError] = useState('');
+  const [showRescheduleDatePicker, setShowRescheduleDatePicker] = useState(false);
 
-  const paymentMethodLabel = (method) => {
-    const value = String(method || '').toLowerCase();
-    if (value === 'maya' || value === 'paymaya') return 'Maya';
-    if (value === 'qrph') return 'QR Ph';
-    return 'GCash';
+  const rescheduleDateKey = `${rescheduleDate.getFullYear()}-${String(rescheduleDate.getMonth() + 1).padStart(2, '0')}-${String(rescheduleDate.getDate()).padStart(2, '0')}`;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!rescheduleModalVisible || !rescheduleTarget?.attorney_id) {
+      setRescheduleSlots([]);
+      return undefined;
+    }
+    (async () => {
+      try {
+        setRescheduleSlotsLoading(true);
+        const slots = await getAvailability(rescheduleTarget.attorney_id, rescheduleDateKey, {
+          force: true,
+        });
+        if (cancelled) return;
+        const unique = Array.from(
+          new Set((slots || []).map(s => String(s.time || '').trim()).filter(Boolean)),
+        );
+        setRescheduleSlots(unique);
+        setRescheduleTime(prev => (unique.includes(prev) ? prev : ''));
+      } catch (e) {
+        if (!cancelled) {
+          setRescheduleSlots([]);
+          setRescheduleError(e?.message || 'Unable to load available slots.');
+        }
+      } finally {
+        if (!cancelled) setRescheduleSlotsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rescheduleModalVisible, rescheduleTarget, rescheduleDateKey]);
+
+  const openRescheduleModal = (item) => {
+    setRescheduleTarget(item);
+    setRescheduleReason('');
+    setRescheduleError('');
+    setRescheduleTime('');
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() + 1);
+    setRescheduleDate(d);
+    setRescheduleModalVisible(true);
   };
 
-  const getReschedulePolicyState = (appointment) => {
+  const closeRescheduleModal = () => {
+    if (rescheduleSubmitting) return;
+    setRescheduleModalVisible(false);
+    setRescheduleTarget(null);
+    setRescheduleError('');
+  };
+
+  const submitRescheduleRequest = async () => {
+    if (!rescheduleTarget?.id) return;
+    if (!rescheduleDateKey || !rescheduleTime) {
+      setRescheduleError('Please select a new date and time.');
+      return;
+    }
+    setRescheduleSubmitting(true);
+    setRescheduleError('');
+    try {
+      const normalizedTime = normalizeSlotTimeLabel(rescheduleTime);
+      const nextSchedule = new Date(`${rescheduleDateKey}T${normalizedTime}`);
+      if (Number.isNaN(nextSchedule.getTime())) {
+        throw new Error('Invalid schedule selected.');
+      }
+      await rescheduleClientAppointment({
+        appointmentId: rescheduleTarget.id,
+        scheduledAt: nextSchedule.toISOString(),
+        note: rescheduleReason.trim(),
+      });
+      invalidateAppointmentsCache();
+      const profile = await getMyProfile();
+      if (profile?.id) {
+        const rows = await fetchClientConsultationQueue(profile.id, { force: true });
+        setQueueItems(rows);
+      }
+      closeRescheduleModal();
+      Alert.alert(
+        'Request submitted',
+        'LegalLink Admin will review your chosen date and time. Your queue updates after approval.',
+      );
+    } catch (e) {
+      setRescheduleError(e?.message || 'Unable to submit reschedule request.');
+    } finally {
+      setRescheduleSubmitting(false);
+    }
+  };
+
+  const getReschedulePolicyState = (item) => {
+    const appointment = queueItemToAppointment(item);
+    const pending = parseReschedulePendingFromNotes(appointment.notes);
+    if (pending?.requestedScheduledAt) {
+      return {
+        can: false,
+        title: 'Reschedule pending approval',
+        reason:
+          'You already submitted a reschedule request. LegalLink Admin is reviewing your chosen date and time.',
+      };
+    }
     const status = String(getEffectiveAppointmentStatus(appointment) || '').toLowerCase();
     if (status === 'completed' || status === 'cancelled' || status === 'rejected') {
       return {
@@ -116,7 +241,8 @@ export default function MyAppointments({ navigation }) {
       return {
         can: false,
         title: 'Appointment Date Has Passed',
-        reason: 'Your consultation schedule has already passed. Please contact BatasMo Admin for further reschedule assistance.',
+        reason:
+          'Your consultation schedule has already passed. Please contact LegalLink Admin for further reschedule assistance.',
       };
     }
 
@@ -126,7 +252,8 @@ export default function MyAppointments({ navigation }) {
       return {
         can: false,
         title: 'Payment Required',
-        reason: 'You can reschedule only after your consultation fee is paid. Complete payment first, then try again.',
+        reason:
+          'You can reschedule only after your consultation fee is paid. Complete payment first, then try again.',
       };
     }
 
@@ -134,7 +261,8 @@ export default function MyAppointments({ navigation }) {
       return {
         can: false,
         title: 'One-Time Reschedule Used',
-        reason: 'You already used your one-time reschedule option. Please contact BatasMo Admin for further changes.',
+        reason:
+          'You already used your one-time reschedule option. Please contact LegalLink Admin for further changes.',
       };
     }
 
@@ -152,7 +280,8 @@ export default function MyAppointments({ navigation }) {
         return {
           can: false,
           title: 'Reschedule Window Closed',
-          reason: 'Reschedule must be done at least 1 day before the consultation date — same-day reschedules are not allowed.',
+          reason:
+            'Reschedule must be done at least 1 day before the consultation date — same-day reschedules are not allowed.',
         };
       }
     } catch (_e) {
@@ -160,7 +289,8 @@ export default function MyAppointments({ navigation }) {
         return {
           can: false,
           title: 'Reschedule Window Closed',
-          reason: 'Reschedule must be done at least 1 day before the consultation date — same-day reschedules are not allowed.',
+          reason:
+            'Reschedule must be done at least 1 day before the consultation date — same-day reschedules are not allowed.',
         };
       }
     }
@@ -168,45 +298,82 @@ export default function MyAppointments({ navigation }) {
     return { can: true, title: '', reason: '' };
   };
 
-  const requestRescheduleViaAdmin = (appointment, dateLabel, timeLabel) => {
+  const requestRescheduleViaAdmin = (item, dateLabel, timeLabel) => {
+    const appointment = queueItemToAppointment(item);
     const draft = buildRescheduleDraft(appointment, dateLabel, timeLabel);
     navigation.navigate('ClientSupportMessages', { initialDraft: draft });
   };
 
-  const handleReschedulePress = (appointment, dateLabel, timeLabel) => {
-    const policy = getReschedulePolicyState(appointment);
+  const handleReschedulePress = (item) => {
+    const { date, time } = formatDateTime(item.scheduledAt || item.date);
+    const policy = getReschedulePolicyState(item);
     if (!policy.can) {
       Alert.alert(policy.title, policy.reason, [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Message Admin',
-          onPress: () => requestRescheduleViaAdmin(appointment, dateLabel, timeLabel),
+          onPress: () => requestRescheduleViaAdmin(item, date, time),
         },
       ]);
       return;
     }
-    requestRescheduleViaAdmin(appointment, dateLabel, timeLabel);
+    openRescheduleModal(item);
   };
 
-  const loadAppointments = useCallback(async () => {
+  const loadQueue = useCallback(async (options = {}) => {
+    const force = Boolean(options?.force);
     try {
-      setLoading(true);
-      const records = await getMyAppointments({ force: true });
-      const list = Array.isArray(records) ? records : [];
-      // Completed consultations live under Logs only — not in full history
-      setAppointments(list.filter(item => !isAppointmentCompleted(item)));
+      if (!force) setLoading(true);
+      await ensureAppConfigLoaded();
+
+      let userId = clientId;
+      if (!userId) {
+        const profile = await getMyProfile();
+        userId = profile?.id;
+        if (userId) setClientId(userId);
+      }
+      if (!userId) {
+        setQueueItems([]);
+        return;
+      }
+
+      const rows = await fetchClientConsultationQueue(userId, { force: true });
+      setQueueItems(Array.isArray(rows) ? rows : []);
     } catch (error) {
-      Alert.alert('Error', error?.message ?? 'Failed to load appointments.');
-      setAppointments([]);
+      Alert.alert('Error', error?.message ?? 'Failed to load consultation queue.');
+      setQueueItems([]);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [clientId]);
 
   useFocusEffect(
     useCallback(() => {
-      loadAppointments();
-    }, [loadAppointments]),
+      let cancelled = false;
+      let unsubscribe = () => {};
+
+      (async () => {
+        await loadQueue({ force: true });
+        if (cancelled) return;
+
+        try {
+          const profile = await getMyProfile();
+          if (cancelled || !profile?.id) return;
+          setClientId(profile.id);
+          unsubscribe = subscribeToClientAppointments(profile.id, () => {
+            invalidateAppointmentsCache();
+            loadQueue({ force: true });
+          });
+        } catch {
+          // ignore
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+        unsubscribe();
+      };
+    }, [loadQueue]),
   );
 
   const handleBack = () => {
@@ -217,37 +384,72 @@ export default function MyAppointments({ navigation }) {
     navigation.navigate('HomepageClient');
   };
 
-  const openPaymentMethodModal = (appointment) => {
-    setPendingPayAppointment(appointment);
-    setSelectedPayMethod('gcash');
-    setPayModalVisible(true);
-  };
-
-  const closePaymentMethodModal = () => {
-    setPayModalVisible(false);
-    setPendingPayAppointment(null);
-  };
-
-  const handleProceedToPayment = () => {
-    if (!pendingPayAppointment) return;
-    closePaymentMethodModal();
+  const handlePayForAppointment = (item) => {
+    if (!item?.id) {
+      return;
+    }
+    warmPaymentBackend().catch(() => {});
     navigation.navigate('Payment', {
-      paymentMethod: selectedPayMethod,
+      paymentMethod: DEFAULT_PAYMENT_METHOD,
       serviceData: {
-        type: pendingPayAppointment?.title ?? 'Consultation',
-        amount: pendingPayAppointment?.amount
-          ? `\u20b1${Number(pendingPayAppointment.amount).toLocaleString()}`
+        type: item?.area ?? 'Consultation',
+        amount: item?.amount
+          ? `\u20b1${Number(item.amount).toLocaleString()}`
           : '\u20b12,500',
       },
       paymentContext: {
         sourceType: 'appointment',
-        sourceId: pendingPayAppointment?.id,
-        attorneyId: pendingPayAppointment?.attorney_id,
-        amount: pendingPayAppointment?.amount != null
-          ? Number(pendingPayAppointment.amount)
-          : undefined,
+        sourceId: item.id,
+        attorneyId: item?.attorney_id,
+        amount: item?.amount != null ? Number(item.amount) : undefined,
       },
     });
+  };
+
+  const handleEnterRoom = (item) => {
+    if (!item?.payment_is_paid && String(item?.payment || '').toLowerCase() !== 'paid') {
+      Alert.alert('Payment required', 'Complete payment before entering the consultation room.');
+      return;
+    }
+    if (item?.chatAccessible === false) {
+      Alert.alert(
+        'Consultation not available yet',
+        'Chat opens on your consultation day (any time that day).',
+      );
+      return;
+    }
+    const name = item?.name ?? 'Attorney';
+    navigation.navigate('EnterConsultationChat', {
+      chatId: item.id,
+      chatName: name,
+      initials: name
+        .split(' ')
+        .map((part) => part[0])
+        .join('')
+        .slice(0, 2)
+        .toUpperCase(),
+    });
+  };
+
+  const renderItemFooter = (item) => {
+    const status = String(getEffectiveAppointmentStatus(queueItemToAppointment(item)) || '').toUpperCase();
+    if (['COMPLETED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      return null;
+    }
+    if (item.pendingReschedule?.requestedScheduledAt) {
+      return (
+        <View style={styles.pendingRescheduleBadge}>
+          <Text style={styles.pendingRescheduleText}>Reschedule pending approval</Text>
+        </View>
+      );
+    }
+    return (
+      <TouchableOpacity
+        style={styles.rescheduleBtn}
+        onPress={() => handleReschedulePress(item)}>
+        <Text style={styles.rescheduleBtnText}>Reschedule</Text>
+      </TouchableOpacity>
+    );
   };
 
   return (
@@ -257,181 +459,115 @@ export default function MyAppointments({ navigation }) {
           <ClientFadeIn>
             <ClientChevronBack style={styles.backHit} onPress={handleBack} />
 
-            <Text style={styles.screenTitle}>My Appointments</Text>
+            <Text style={styles.screenTitle}>Consultation Queue</Text>
             <Text style={styles.screenSubtitle}>
-              Active and upcoming bookings. Completed sessions are in Logs.
+              Your upcoming consultations sorted by date. Completed sessions are in Logs.
             </Text>
           </ClientFadeIn>
 
-          {loading ? (
-            <View style={styles.emptyCard}>
-              <ActivityIndicator color={T.gold[1]} />
-              <Text style={styles.emptyText}>Loading appointments...</Text>
-            </View>
-          ) : appointments.length === 0 ? (
-            <View style={styles.emptyCard}>
-              <Text style={styles.emptyTitle}>No active appointments</Text>
-              <Text style={styles.emptyText}>
-                Completed consultations are saved under Logs in the menu.
-              </Text>
-            </View>
-          ) : (
-            appointments.map((item, index) => {
-              const effective = getEffectiveAppointmentStatus(item);
-              const status = effective.toUpperCase();
-              const { date, time } = formatDateTime(resolveScheduleValue(item));
-              const canChat = status === 'CONFIRMED' || status === 'RESCHEDULED';
-              return (
-                <ClientFadeIn key={item.id} delay={60 + index * 55}>
-                  <View style={styles.card}>
-                    <View style={styles.cardHeader}>
-                      <View>
-                        <Text style={styles.lawyerName}>{item.attorney_name ?? 'Attorney not assigned'}</Text>
-                        <Text style={styles.specialty}>{item.title ?? 'Consultation'}</Text>
-                      </View>
-                      <View style={styles.badgeRow}>
-                        <View style={styles.badgeDark}>
-                          <Text style={styles.badgeDarkText}>{status}</Text>
-                        </View>
-                      </View>
-                    </View>
-
-                    <Text style={styles.detailText}>📅 {date}</Text>
-                    <Text style={styles.detailText}>🕒 {time}</Text>
-                    <Text style={styles.detailText}>
-                      📝{' '}
-                      {formatAppointmentNotesForDisplay(item.notes) || 'No additional notes'}
-                    </Text>
-
-                    {canChat ? (
-                      <TouchableOpacity
-                        style={styles.primaryButton}
-                        onPress={() =>
-                          navigation.navigate('EnterConsultationChat', {
-                            chatId: item.id,
-                            chatName: item.attorney_name ?? 'Attorney',
-                            initials: (item.attorney_name ?? 'Attorney')
-                              .split(' ')
-                              .map(part => part[0])
-                              .join('')
-                              .slice(0, 2)
-                              .toUpperCase(),
-                          })
-                        }>
-                        <Text style={styles.primaryButtonText}>Message Attorney</Text>
-                      </TouchableOpacity>
-                    ) : status === 'PENDING' ? (
-                      <TouchableOpacity
-                        style={styles.payNowButton}
-                        onPress={() => openPaymentMethodModal(item)}>
-                        <Text style={styles.payNowButtonText}>Proceed to Payment</Text>
-                      </TouchableOpacity>
-                    ) : (
-                      <View style={styles.pendingState}>
-                        <Text style={styles.pendingStateText}>
-                          {status === 'CANCELLED'
-                            ? 'Appointment cancelled'
-                            : 'Awaiting attorney approval'}
-                        </Text>
-                      </View>
-                    )}
-
-                    {(!['COMPLETED', 'CANCELLED', 'REJECTED'].includes(status)) && (
-                      <TouchableOpacity
-                        style={[styles.payNowButton, { backgroundColor: '#333', marginTop: 8 }]}
-                        onPress={() => handleReschedulePress(item, date, time)}>
-                        <Text style={styles.payNowButtonText}>Req. Reschedule (Msg Admin)</Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                </ClientFadeIn>
-              );
-            })
-          )}
+          <ClientConsultationQueue
+            items={queueItems}
+            loading={loading}
+            emptyTitle="No consultations in queue"
+            emptySubtitle="Book a consultation from the home screen. Completed sessions are in Logs."
+            onEnterRoom={handleEnterRoom}
+            onPay={handlePayForAppointment}
+            renderItemFooter={renderItemFooter}
+          />
         </ScrollView>
       </ClientScreenShell>
 
       <Modal
-        visible={payModalVisible}
+        visible={rescheduleModalVisible}
         animationType="slide"
         transparent
-        onRequestClose={closePaymentMethodModal}>
+        onRequestClose={closeRescheduleModal}>
         <TouchableOpacity
           style={styles.payModalBackdrop}
           activeOpacity={1}
-          onPress={closePaymentMethodModal}
+          onPress={closeRescheduleModal}
         />
         <View style={styles.paySheet}>
           <View style={styles.paySheetHandle} />
-          <Text style={styles.paySheetTitle}>Select Payment Method</Text>
+          <Text style={styles.paySheetTitle}>Request reschedule</Text>
+          <Text style={styles.rescheduleModalSub}>
+            Choose a new date and time. Admin approval is required before your schedule changes.
+          </Text>
 
           <TouchableOpacity
-            style={[
-              styles.payOption,
-              selectedPayMethod === 'gcash' && styles.payOptionActive,
-            ]}
-            onPress={() => setSelectedPayMethod('gcash')}>
-            <View style={styles.payOptionIcon}>
-              <Text style={styles.payOptionIconText}>📱</Text>
-            </View>
-            <View style={styles.payOptionInfo}>
-              <Text style={styles.payOptionName}>GCash</Text>
-              <Text style={styles.payOptionSub}>Pay via GCash e-wallet</Text>
-            </View>
-            {selectedPayMethod === 'gcash' && (
-              <Text style={styles.payCheck}>✓</Text>
+            style={styles.rescheduleDateBtn}
+            onPress={() => setShowRescheduleDatePicker(true)}>
+            <Text style={styles.rescheduleDateBtnLabel}>Date</Text>
+            <Text style={styles.rescheduleDateBtnValue}>{rescheduleDateKey}</Text>
+          </TouchableOpacity>
+
+          {showRescheduleDatePicker && (
+            <DateTimePicker
+              value={rescheduleDate}
+              mode="date"
+              display={IS_IOS ? 'spinner' : 'default'}
+              minimumDate={new Date(Date.now() + 86400000)}
+              onChange={(_, selected) => {
+                if (IS_ANDROID) setShowRescheduleDatePicker(false);
+                if (selected) setRescheduleDate(selected);
+              }}
+            />
+          )}
+
+          <Text style={styles.rescheduleSlotsLabel}>Available times</Text>
+          {rescheduleSlotsLoading ? (
+            <ActivityIndicator color={T.gold[1]} style={{ marginVertical: 12 }} />
+          ) : rescheduleSlots.length === 0 ? (
+            <Text style={styles.rescheduleEmptySlots}>No open slots on this date.</Text>
+          ) : (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.slotScroll}>
+              {rescheduleSlots.map(slot => (
+                <TouchableOpacity
+                  key={slot}
+                  style={[
+                    styles.slotChip,
+                    rescheduleTime === slot && styles.slotChipActive,
+                  ]}
+                  onPress={() => setRescheduleTime(slot)}>
+                  <Text
+                    style={[
+                      styles.slotChipText,
+                      rescheduleTime === slot && styles.slotChipTextActive,
+                    ]}>
+                    {slot}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          )}
+
+          <TextInput
+            style={styles.rescheduleReasonInput}
+            placeholder="Reason (optional)"
+            placeholderTextColor={T.textSoft}
+            value={rescheduleReason}
+            onChangeText={setRescheduleReason}
+            multiline
+            maxLength={500}
+          />
+
+          {rescheduleError ? (
+            <Text style={styles.rescheduleErrorText}>{rescheduleError}</Text>
+          ) : null}
+
+          <TouchableOpacity
+            style={[styles.payProceedBtn, rescheduleSubmitting && styles.payProceedBtnDisabled]}
+            onPress={submitRescheduleRequest}
+            disabled={rescheduleSubmitting}>
+            {rescheduleSubmitting ? (
+              <ActivityIndicator color={T.base} />
+            ) : (
+              <Text style={styles.payProceedText}>Submit request</Text>
             )}
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[
-              styles.payOption,
-              selectedPayMethod === 'maya' && styles.payOptionActive,
-            ]}
-            onPress={() => setSelectedPayMethod('maya')}>
-            <View style={[styles.payOptionIcon, { backgroundColor: 'rgba(124,58,237,0.2)' }]}>
-              <Text style={styles.payOptionIconText}>💜</Text>
-            </View>
-            <View style={styles.payOptionInfo}>
-              <Text style={styles.payOptionName}>Maya</Text>
-              <Text style={styles.payOptionSub}>Pay via Maya e-wallet</Text>
-            </View>
-            {selectedPayMethod === 'maya' && (
-              <Text style={styles.payCheck}>✓</Text>
-            )}
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[
-              styles.payOption,
-              selectedPayMethod === 'qrph' && styles.payOptionActive,
-            ]}
-            onPress={() => setSelectedPayMethod('qrph')}>
-            <View style={[styles.payOptionIcon, { backgroundColor: 'rgba(15, 23, 42, 0.35)' }]}> 
-              <Text style={styles.payOptionIconText}>🔳</Text>
-            </View>
-            <View style={styles.payOptionInfo}>
-              <Text style={styles.payOptionName}>QR Ph</Text>
-              <Text style={styles.payOptionSub}>Scan QR Ph to pay</Text>
-            </View>
-            {selectedPayMethod === 'qrph' && (
-              <Text style={styles.payCheck}>✓</Text>
-            )}
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.payProceedBtn}
-            onPress={handleProceedToPayment}>
-            <Text style={styles.payProceedText}>
-              Continue with {paymentMethodLabel(selectedPayMethod)}
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={styles.payCancelBtn} onPress={closePaymentMethodModal}>
-            <Text style={styles.payCancelText}>Cancel</Text>
           </TouchableOpacity>
         </View>
       </Modal>
+
     </>
   );
 }
@@ -440,74 +576,84 @@ const styles = StyleSheet.create({
   content: { padding: 20, paddingBottom: 32 },
   backHit: { alignSelf: 'flex-start', marginBottom: 10 },
   screenTitle: { fontSize: 28, fontWeight: 'bold', color: T.text },
-  screenSubtitle: { color: T.textSoft, marginBottom: 16 },
-  card: {
-    backgroundColor: 'rgba(18, 26, 36, 0.85)',
-    borderRadius: 20,
-    padding: 16,
-    marginBottom: 14,
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.12)',
-  },
-  cardHeader: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10 },
-  lawyerName: { fontSize: 18, fontWeight: '700', color: T.text },
-  specialty: { fontSize: 13, color: T.textSoft },
-  badgeRow: { flexDirection: 'row' },
-  badgeDark: {
-    backgroundColor: 'rgba(244, 215, 139, 0.18)',
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    marginLeft: 6,
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.25)',
-  },
-  badgeDarkText: { color: T.gold[0], fontSize: 10, fontWeight: '700' },
-  detailText: { color: T.textMuted, marginBottom: 4 },
-  primaryButton: {
-    marginTop: 12,
-    backgroundColor: T.gold[1],
+  screenSubtitle: { color: T.textSoft, marginBottom: 16, lineHeight: 20 },
+  rescheduleBtn: {
+    backgroundColor: 'rgba(51, 51, 51, 0.9)',
     borderRadius: 12,
-    paddingVertical: 12,
-    alignItems: 'center',
-  },
-  primaryButtonText: { color: T.base, fontWeight: '700' },
-  pendingState: {
-    marginTop: 12,
-    backgroundColor: 'rgba(251, 191, 36, 0.12)',
-    borderRadius: 10,
-    paddingVertical: 10,
+    paddingVertical: 11,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(251, 191, 36, 0.25)',
+    borderColor: 'rgba(244, 215, 139, 0.15)',
   },
-  pendingStateText: { color: T.gold[0], fontWeight: '700' },
-  emptyCard: {
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.12)',
-    borderRadius: 20,
-    backgroundColor: 'rgba(18, 26, 36, 0.62)',
-    padding: 20,
-    alignItems: 'center',
-  },
-  emptyTitle: { fontSize: 16, fontWeight: '700', color: T.text, marginBottom: 6 },
-  emptyText: { fontSize: 13, color: T.textSoft, textAlign: 'center' },
-  payNowButton: {
-    marginTop: 12,
-    backgroundColor: T.gold[1],
+  rescheduleBtnText: { color: T.text, fontWeight: '700', fontSize: 12 },
+  pendingRescheduleBadge: {
+    backgroundColor: 'rgba(234, 179, 8, 0.15)',
     borderRadius: 12,
-    paddingVertical: 12,
+    paddingVertical: 11,
     alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(234, 179, 8, 0.35)',
   },
-  payNowButtonText: { color: T.base, fontWeight: '700' },
+  pendingRescheduleText: { color: '#FCD34D', fontWeight: '700', fontSize: 12 },
+  rescheduleModalSub: {
+    color: T.textSoft,
+    fontSize: 13,
+    lineHeight: 18,
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  rescheduleDateBtn: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(244,215,139,0.2)',
+    marginBottom: 12,
+  },
+  rescheduleDateBtnLabel: { color: T.textSoft, fontSize: 13 },
+  rescheduleDateBtnValue: { color: T.text, fontWeight: '700', fontSize: 14 },
+  rescheduleSlotsLabel: { color: T.textSoft, fontSize: 12, marginBottom: 8 },
+  rescheduleEmptySlots: { color: T.textSoft, fontSize: 13, marginBottom: 12 },
+  slotScroll: { marginBottom: 12, maxHeight: 44 },
+  slotChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(244,215,139,0.25)',
+    marginRight: 8,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+  },
+  slotChipActive: { borderColor: T.gold[1], backgroundColor: 'rgba(244,215,139,0.15)' },
+  slotChipText: { color: T.textSoft, fontSize: 13, fontWeight: '600' },
+  slotChipTextActive: { color: T.gold[0] },
+  rescheduleReasonInput: {
+    borderWidth: 1,
+    borderColor: 'rgba(244,215,139,0.2)',
+    borderRadius: 12,
+    padding: 12,
+    color: T.text,
+    minHeight: 72,
+    marginBottom: 8,
+    textAlignVertical: 'top',
+  },
+  rescheduleErrorText: { color: '#FCA5A5', fontSize: 13, marginBottom: 8 },
+  payProceedBtnDisabled: { opacity: 0.6 },
   payModalBackdrop: {
     position: 'absolute',
-    top: 0, left: 0, right: 0, bottom: 0,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     backgroundColor: 'rgba(4,7,11,0.65)',
   },
   paySheet: {
     position: 'absolute',
-    bottom: 0, left: 0, right: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
     backgroundColor: 'rgba(18,26,36,0.98)',
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
@@ -517,18 +663,28 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(244,215,139,0.15)',
   },
   paySheetHandle: {
-    width: 40, height: 4, borderRadius: 2,
+    width: 40,
+    height: 4,
+    borderRadius: 2,
     backgroundColor: 'rgba(255,255,255,0.2)',
-    alignSelf: 'center', marginBottom: 20,
+    alignSelf: 'center',
+    marginBottom: 20,
   },
   paySheetTitle: {
-    fontSize: 18, fontWeight: '700', color: T.text,
-    textAlign: 'center', marginBottom: 20,
+    fontSize: 18,
+    fontWeight: '700',
+    color: T.text,
+    textAlign: 'center',
+    marginBottom: 20,
   },
   payOption: {
-    flexDirection: 'row', alignItems: 'center',
-    padding: 16, borderRadius: 16, marginBottom: 12,
-    borderWidth: 1.5, borderColor: 'rgba(244,215,139,0.1)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 16,
+    borderRadius: 16,
+    marginBottom: 12,
+    borderWidth: 1.5,
+    borderColor: 'rgba(244,215,139,0.1)',
     backgroundColor: 'rgba(255,255,255,0.04)',
   },
   payOptionActive: {
@@ -536,9 +692,13 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(244,215,139,0.08)',
   },
   payOptionIcon: {
-    width: 44, height: 44, borderRadius: 12,
+    width: 44,
+    height: 44,
+    borderRadius: 12,
     backgroundColor: 'rgba(59,130,246,0.2)',
-    justifyContent: 'center', alignItems: 'center', marginRight: 14,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 14,
   },
   payOptionIconText: { fontSize: 22 },
   payOptionInfo: { flex: 1 },
@@ -546,8 +706,11 @@ const styles = StyleSheet.create({
   payOptionSub: { fontSize: 12, color: T.textSoft, marginTop: 2 },
   payCheck: { color: T.gold[0], fontSize: 20, fontWeight: '700' },
   payProceedBtn: {
-    backgroundColor: T.gold[1], paddingVertical: 16,
-    borderRadius: 14, alignItems: 'center', marginTop: 8,
+    backgroundColor: T.gold[1],
+    paddingVertical: 16,
+    borderRadius: 14,
+    alignItems: 'center',
+    marginTop: 8,
   },
   payProceedText: { color: T.base, fontWeight: '800', fontSize: 16 },
   payCancelBtn: { paddingVertical: 14, alignItems: 'center', marginTop: 4 },

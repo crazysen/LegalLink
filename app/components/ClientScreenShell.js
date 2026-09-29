@@ -27,7 +27,10 @@ const androidTextSafeProps = IS_ANDROID
 
 /** Screen content entrance (reference motion). */
 export function ClientFadeIn({children, delay = 0, style, entering}) {
-  const anim = entering ?? FadeInDown.duration(420).delay(delay);
+  // FadeInDown on Android can surface "Text strings must be rendered within <Text>" for text-heavy trees.
+  const anim =
+    entering ??
+    (IS_ANDROID ? FadeIn.duration(420).delay(delay) : FadeInDown.duration(420).delay(delay));
   return (
     <Animated.View entering={anim} style={style} {...androidTextSafeProps}>
       {children}

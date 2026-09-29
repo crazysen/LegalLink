@@ -110,7 +110,7 @@ function mapRow(row, roomId, isClosed, userId) {
 }
 
 /**
- * @returns {Promise<{ rows: ReturnType<typeof mapRow>[], isClosed: boolean }>}
+ * @returns {Promise<{ rows: ReturnType<typeof mapRow>[], isClosed: boolean, roomId: string | null, videoMeetingId: string | null }>}
  */
 export async function getAppointmentMessages(appointmentId) {
   const { data: { user } } = await supabase.auth.getUser();
@@ -121,6 +121,7 @@ export async function getAppointmentMessages(appointmentId) {
     .select(`
       id,
       is_closed,
+      video_meeting_id,
       messages (
         id,
         sender_id,
@@ -140,7 +141,12 @@ export async function getAppointmentMessages(appointmentId) {
 
   if (error || !data) {
     const room = await getOrCreateRoom(appointmentId);
-    return {rows: [], isClosed: Boolean(room.is_closed)};
+    return {
+      rows: [],
+      isClosed: Boolean(room.is_closed),
+      roomId: room.id || null,
+      videoMeetingId: room.video_meeting_id ?? null,
+    };
   }
 
   const list = (data.messages || []).slice().sort((a, b) =>
@@ -149,44 +155,111 @@ export async function getAppointmentMessages(appointmentId) {
 
   const isClosed = Boolean(data.is_closed);
   const rows = list.map(row => mapRow(row, data.id, isClosed, user.id));
-  return {rows, isClosed};
+  return {
+    rows,
+    isClosed,
+    roomId: data.id,
+    videoMeetingId: data.video_meeting_id ?? null,
+  };
 }
 
 /**
- * Attorney-only (enforced by RLS). Sets consultation room to closed; no new messages allowed.
- * If no row exists yet, inserts a closed room (same as web end-session flow).
+ * Attorney-only: closes consultation room, clears video meeting, marks appointment completed.
  */
-export async function closeConsultationRoom(appointmentId) {
-  const {data: existing, error: selErr} = await supabase
+export async function endConsultationSession(appointmentId) {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) throw new Error('Not authenticated');
+  if (!appointmentId) throw new Error('Appointment is required.');
+
+  const nowIso = new Date().toISOString();
+
+  const { data: appointment, error: appointmentError } = await supabase
+    .from('appointments')
+    .select('id, attorney_id, status')
+    .eq('id', appointmentId)
+    .maybeSingle();
+
+  if (appointmentError) throw new Error(appointmentError.message);
+  if (!appointment) throw new Error('Appointment not found.');
+  if (String(appointment.attorney_id) !== String(user.id)) {
+    throw new Error('Only the assigned attorney can end this consultation.');
+  }
+
+  const { data: existingRoom, error: roomSelectError } = await supabase
     .from('consultation_rooms')
     .select('id')
     .eq('appointment_id', appointmentId)
     .maybeSingle();
 
-  if (selErr) {
-    throw new Error(selErr.message);
-  }
+  if (roomSelectError) throw new Error(roomSelectError.message);
 
-  if (!existing?.id) {
-    const {error} = await supabase
+  if (existingRoom?.id) {
+    const { error: closeError } = await supabase
       .from('consultation_rooms')
-      .insert({appointment_id: appointmentId, is_closed: true})
-      .select('id')
-      .single();
-    if (error) {
-      throw new Error(error.message);
-    }
+      .update({ is_closed: true, video_meeting_id: null })
+      .eq('id', existingRoom.id);
+
+    if (closeError) throw new Error(closeError.message);
   } else {
-    const {error} = await supabase
+    const { error: createClosedRoomError } = await supabase
       .from('consultation_rooms')
-      .update({is_closed: true})
-      .eq('id', existing.id);
-    if (error) {
-      throw new Error(error.message);
-    }
+      .insert({ appointment_id: appointmentId, is_closed: true });
+
+    if (createClosedRoomError) throw new Error(createClosedRoomError.message);
   }
 
-  await completeAppointmentAfterConsultationEnded(appointmentId);
+  const { error: appointmentUpdateError } = await supabase
+    .from('appointments')
+    .update({ status: 'completed', updated_at: nowIso })
+    .eq('id', appointmentId);
+
+  if (appointmentUpdateError) throw new Error(appointmentUpdateError.message);
+
+  return true;
+}
+
+/** @deprecated Use endConsultationSession */
+export async function closeConsultationRoom(appointmentId) {
+  return endConsultationSession(appointmentId);
+}
+
+export async function notifyClientConsultationTimeWarning(appointmentId) {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) throw new Error('Not authenticated');
+  if (!appointmentId) throw new Error('Appointment is required.');
+
+  const { data: appointment, error: appointmentError } = await supabase
+    .from('appointments')
+    .select('id, attorney_id, client_id, title')
+    .eq('id', appointmentId)
+    .maybeSingle();
+
+  if (appointmentError) throw new Error(appointmentError.message);
+  if (!appointment) throw new Error('Appointment not found.');
+  if (String(appointment.attorney_id) !== String(user.id)) {
+    throw new Error('Only the assigned attorney can send this reminder.');
+  }
+
+  const nowIso = new Date().toISOString();
+  const consultationLabel = appointment.title || 'your consultation';
+
+  const { error: notificationError } = await supabase.from('notifications').insert({
+    user_id: appointment.client_id,
+    title: 'Consultation Reminder',
+    body: `Only 10 minutes left in ${consultationLabel}. Please prepare your final questions. Ref #${appointment.id}`,
+    type: 'consultation_time_warning',
+    is_read: false,
+    created_at: nowIso,
+  });
+
+  if (notificationError) throw new Error(notificationError.message);
+  return true;
 }
 
 /**
@@ -206,6 +279,41 @@ export async function saveAttorneyConsultationSummary(appointmentId, summary) {
   if (error) {
     throw new Error(error.message);
   }
+}
+
+/** Attorney tags a completed consultation with the practice branch (updates appointment title). */
+export async function saveAttorneyConsultationBranch({appointmentId, branch}) {
+  if (!appointmentId) throw new Error('appointmentId is required.')
+  const trimmed = String(branch || '').trim()
+  if (!trimmed) throw new Error('Please select a consultation branch.')
+
+  const {
+    data: {user},
+  } = await supabase.auth.getUser()
+  if (!user?.id) throw new Error('Not authenticated')
+
+  const {data: appt, error: fetchError} = await supabase
+    .from('appointments')
+    .select('id, attorney_id')
+    .eq('id', appointmentId)
+    .maybeSingle()
+
+  if (fetchError) throw new Error(fetchError.message)
+  if (!appt) throw new Error('Appointment not found.')
+  if (String(appt.attorney_id) !== String(user.id)) {
+    throw new Error('You can only update your own consultations.')
+  }
+
+  const {error} = await supabase
+    .from('appointments')
+    .update({
+      title: `Consultation - ${trimmed}`,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', appointmentId)
+    .eq('attorney_id', user.id)
+
+  if (error) throw new Error(error.message)
 }
 
 export async function sendAppointmentMessage(appointmentId, text) {
@@ -245,7 +353,7 @@ export async function uploadAndSendChatAttachment(appointmentId, asset) {
 
   const mime = String(asset.mime || 'application/octet-stream').toLowerCase();
   const size = Number(asset.size) || 0;
-  const v = validateAttachment(size, mime);
+  const v = validateAttachment(size, mime, asset.fileName);
   if (!v.ok) throw new Error(v.error);
 
   const room = await getOrCreateRoom(appointmentId);
@@ -264,7 +372,7 @@ export async function uploadAndSendChatAttachment(appointmentId, asset) {
   if (actualSize === 0) {
     throw new Error('The selected file is empty or unreadable.');
   }
-  const vSize = validateAttachment(actualSize, mime);
+  const vSize = validateAttachment(actualSize, mime, asset.fileName);
   if (!vSize.ok) {
     throw new Error(vSize.error);
   }
@@ -322,6 +430,7 @@ export async function subscribeToConsultationRoom(appointmentId, callbacks) {
 
   const room = await getOrCreateRoom(appointmentId);
   const onMessageInsert = callbacks?.onMessageInsert;
+  const onMessageDelete = callbacks?.onMessageDelete;
   const onRoomUpdate = callbacks?.onRoomUpdate;
 
   /** Matches web: messages on `chat-room:<room_id>`, room + video on `consultation-room-status:<appointment_id>`. */
@@ -363,6 +472,20 @@ export async function subscribeToConsultationRoom(appointmentId, callbacks) {
         onMessageInsert(mapped);
       },
     )
+    .on(
+      'postgres_changes',
+      {
+        event: 'DELETE',
+        schema: 'public',
+        table: 'messages',
+        filter: `room_id=eq.${room.id}`,
+      },
+      payload => {
+        const row = payload.old;
+        if (!row?.id || !onMessageDelete) return;
+        onMessageDelete({id: row.id});
+      },
+    )
     .subscribe();
 
   const statusChannel = supabase
@@ -379,15 +502,11 @@ export async function subscribeToConsultationRoom(appointmentId, callbacks) {
         if (!onRoomUpdate) return;
         const next = payload.new;
         if (!next) return;
-        if (typeof next.is_closed === 'boolean') {
-          onRoomUpdate({
-            is_closed: next.is_closed,
-            video_meeting_id:
-              next.video_meeting_id === undefined
-                ? undefined
-                : next.video_meeting_id,
-          });
-        }
+        onRoomUpdate({
+          is_closed: Boolean(next.is_closed),
+          video_meeting_id: next.video_meeting_id ?? null,
+          room_id: next.id ?? null,
+        });
       },
     )
     .subscribe();

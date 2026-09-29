@@ -11,6 +11,7 @@ import {
   View,
 } from 'react-native';
 import {getMyAppointments} from '../services/appointmentService';
+import {ensureAppConfigLoaded} from '../services/userApi';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
 import {ClientScreenShell, ClientFadeIn} from '../components/ClientScreenShell';
 import ClientChevronBack from '../components/ClientChevronBack';
@@ -25,7 +26,8 @@ const MessagesHub = ({ navigation }) => {
   const loadAppointments = useCallback(async () => {
     try {
       setLoading(true);
-      const rows = await getMyAppointments();
+      await ensureAppConfigLoaded();
+      const rows = await getMyAppointments({force: true});
       setAppointments(Array.isArray(rows) ? rows : []);
     } catch (error) {
       Alert.alert('Error', error?.message ?? 'Failed to load messages.');
@@ -64,6 +66,8 @@ const MessagesHub = ({ navigation }) => {
               .slice(0, 2)
               .toUpperCase(),
             unread: 0,
+            chatAccessible: item.chatAccessible !== false,
+            chatBlockedMessage: item.chatBlockedMessage || '',
           };
         }),
     [appointments],
@@ -83,7 +87,13 @@ const MessagesHub = ({ navigation }) => {
 
   // Handle chat item press
   const handleChatPress = (chat) => {
-    // Navigate to chat screen if navigation is available
+    if (!chat.chatAccessible) {
+      Alert.alert(
+        'Consultation not available yet',
+        chat.chatBlockedMessage || 'Chat opens on your consultation day (any time that day).',
+      );
+      return;
+    }
     if (navigation && navigation.navigate) {
       navigation.navigate('EnterConsultationChat', { 
         chatId: chat.id,
@@ -122,11 +132,11 @@ const MessagesHub = ({ navigation }) => {
         </View>
         <View style={styles.chatHeader}>
           <Text style={styles.chatPreview} numberOfLines={1}>{item.msg}</Text>
-          {item.unread && (
+          {Number(item.unread) > 0 ? (
             <View style={styles.unreadBadge}>
-              <Text style={styles.unreadText}>{item.unread}</Text>
+              <Text style={styles.unreadText}>{String(item.unread)}</Text>
             </View>
-          )}
+          ) : null}
         </View>
       </View>
     </TouchableOpacity>
@@ -141,7 +151,7 @@ const MessagesHub = ({ navigation }) => {
       <ClientFadeIn>
       <View style={styles.header}>
         <ClientChevronBack style={styles.backHit} onPress={handleBack} />
-        <Text style={styles.brand}>BATASMO HUB</Text>
+        <Text style={styles.brand}>LEGALLINK HUB</Text>
         <Text style={styles.title}>Messages</Text>
       </View>
 
@@ -154,11 +164,11 @@ const MessagesHub = ({ navigation }) => {
             source={require('../assets/images/logo.jpg')}
             style={styles.adminSupportAvatarImage}
             resizeMode="cover"
-            accessibilityLabel="BatasMo Admin"
+            accessibilityLabel="LegalLink Admin"
           />
         </View>
         <View style={styles.adminSupportTextCol}>
-          <Text style={styles.adminSupportTitle}>BatasMo Admin</Text>
+          <Text style={styles.adminSupportTitle}>LegalLink Admin</Text>
           <Text style={styles.adminSupportSub} numberOfLines={2}>
             Questions, payments, or reschedule help — tap to message admin.
           </Text>

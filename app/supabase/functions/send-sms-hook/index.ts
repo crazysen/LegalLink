@@ -121,7 +121,7 @@ Deno.serve(async (req) => {
     }
 
     const phoneNumber = toIprogPhoneNumber(to);
-    const message = `Your BatasMo verification code is: ${otp}`;
+    const message = `Your LegalLink verification code is: ${otp}`;
 
     const res = await fetch(iprogUrl, {
       method: "POST",

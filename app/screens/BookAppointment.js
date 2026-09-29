@@ -1,25 +1,32 @@
-import React, {useCallback, useEffect, useState, useMemo} from 'react';
+import React, {useCallback, useEffect, useState, useMemo, useRef} from 'react';
+import {useFocusEffect} from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
   Alert,
   FlatList,
   Image,
+  RefreshControl,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
 import {MaterialCommunityIcons} from '@expo/vector-icons';
-import {getAttorneys} from '../services/attorneyService';
+import {
+  fetchBookableAttorneys,
+  getCurrentSessionProfile,
+  subscribeToAvailabilitySlots,
+} from '../services/userApi';
+import {getBundledAttorneyPhotoSource} from '../constants/attorneyPhotos';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
-import {ClientScreenShell, ClientFadeIn} from '../components/ClientScreenShell';
+import {ClientScreenShell, ClientFadeIn, ClientFadeInSoft} from '../components/ClientScreenShell';
 import ClientChevronBack from '../components/ClientChevronBack';
 
-const ATTORNEYS_CACHE_KEY = 'book_attorneys_cache_v3';
+const ATTORNEYS_CACHE_KEY = 'book_attorneys_cache_v8';
 const ATTORNEYS_CACHE_TTL_MS = 5 * 60 * 1000;
+const ATTORNEYS_POLL_MS = 10 * 1000;
 
-/** Back column + gap so subtitle aligns with title text, not the chevron. */
 const HEADER_BACK_COL = 28;
 const HEADER_BACK_GAP = 8;
 const SUBTITLE_INDENT = HEADER_BACK_COL + HEADER_BACK_GAP;
@@ -28,92 +35,111 @@ function initialsFromName(name) {
   const parts = String(name || '')
     .trim()
     .split(/\s+/)
-    .filter(Boolean);
-  if (parts.length === 0) {
-    return '?';
-  }
-  if (parts.length === 1) {
-    return parts[0].slice(0, 2).toUpperCase();
-  }
+    .filter(Boolean)
+    .filter(p => !/^atty\.?$/i.test(p));
+  if (parts.length === 0) return '?';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
-function formatSpecialties(raw) {
-  if (Array.isArray(raw)) {
-    const s = raw.map(x => String(x || '').trim()).filter(Boolean);
-    return s.length ? s.join(', ') : 'General Practice';
+function isPreventDoubleBookingFlagOn(raw, fallback = true) {
+  if (typeof raw === 'boolean') return raw;
+  if (typeof raw === 'number') return raw !== 0;
+  if (typeof raw === 'string') {
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1') return true;
+    if (normalized === 'false' || normalized === '0') return false;
   }
-  if (typeof raw === 'string' && raw.trim()) {
-    return raw.trim();
-  }
-  return 'General Practice';
+  return fallback;
 }
 
-function AttorneyAvatar({uri, name}) {
+/** Web `ba-card__photo` — bundled roster images first, then remote `img` URL. */
+function AttorneyPhoto({uri, name, size = 88}) {
   const initials = useMemo(() => initialsFromName(name), [name]);
+  const bundledSource = useMemo(() => getBundledAttorneyPhotoSource(name), [name]);
   const [failed, setFailed] = useState(false);
-  const showPlaceholder = !uri || failed;
+  const photoUri = uri && !failed && !bundledSource ? uri : null;
+  const radius = size / 2;
+  const frameStyle = [
+    styles.avatar,
+    {width: size, height: size, borderRadius: radius},
+  ];
 
-  if (showPlaceholder) {
+  if (bundledSource) {
     return (
-      <View style={[styles.avatar, styles.avatarPlaceholder]}>
-        <Text style={styles.avatarInitials}>{initials}</Text>
-      </View>
+      <Image
+        source={bundledSource}
+        style={frameStyle}
+        resizeMode="cover"
+        accessibilityLabel={`${name || 'Attorney'} photo`}
+      />
+    );
+  }
+
+  if (photoUri) {
+    return (
+      <Image
+        source={{uri: photoUri}}
+        style={frameStyle}
+        resizeMode="cover"
+        onError={() => setFailed(true)}
+        accessibilityLabel={`${name || 'Attorney'} photo`}
+      />
     );
   }
 
   return (
-    <Image
-      source={{uri}}
-      style={styles.avatar}
-      onError={() => setFailed(true)}
-    />
+    <View style={[frameStyle, styles.avatarPlaceholder]}>
+      <Text style={[styles.avatarInitials, size < 72 && {fontSize: 22}]}>{initials}</Text>
+    </View>
   );
 }
 
-/** Matches web Book Appointment: dark card, photo, name + star, scales + specialty, rating line, white price, dark Book / outline View. */
-const AttorneyCard = ({item, navigation}) => (
-  <View style={styles.card}>
-    <View style={styles.profileContainer}>
-      <AttorneyAvatar uri={item.avatarUri} name={item.name} />
-    </View>
+/** Web-aligned attorney card (mayy16 / BookAppointment.js). */
+const AttorneyCard = ({item, navigation, onBookNow}) => {
+  const slotCount = Array.isArray(item.availableSlots) ? item.availableSlots.length : 0;
+  const zeroSlots = slotCount === 0;
 
-    <View style={styles.infoContainer}>
+  return (
+    <View style={styles.card}>
+      <AttorneyPhoto uri={item.img} name={item.name} size={88} />
+
       <View style={styles.nameRow}>
         <Text style={styles.nameText} numberOfLines={2}>
           {item.name}
         </Text>
-        {item.isVerified ? (
-          <MaterialCommunityIcons
-            name="check-decagram"
-            size={17}
-            color={T.gold[0]}
-            style={styles.nameStar}
-            accessibilityLabel="Verified attorney"
-          />
-        ) : null}
+        <MaterialCommunityIcons
+          name="check-decagram"
+          size={17}
+          color={T.gold[0]}
+          style={styles.nameStar}
+        />
       </View>
 
       <View style={styles.specialtyRow}>
-        <MaterialCommunityIcons
-          name="scale-balance"
-          size={15}
-          color={T.textSoft}
-          style={styles.specialtyIcon}
-        />
-        <Text style={styles.specialtyText}>{item.specialty}</Text>
+        <MaterialCommunityIcons name="scale-balance" size={15} color={T.textSoft} />
+        <Text style={styles.specialtyText} numberOfLines={2}>
+          {item.specialty}
+        </Text>
       </View>
 
-      <Text style={styles.experienceText}>{item.experience}</Text>
+      <Text style={styles.experienceText}>{item.exp}</Text>
 
-      <Text style={styles.ratingLine}>{item.ratingLine}</Text>
+      <Text style={styles.ratingLine}>
+        {slotCount} slot{slotCount === 1 ? '' : 's'} open
+      </Text>
 
       <Text style={styles.priceText}>{item.price}</Text>
 
       <TouchableOpacity
         style={styles.bookButton}
         activeOpacity={0.88}
-        onPress={() => navigation.navigate('BookNow', {attorney: item})}>
+        onPress={() => onBookNow(item)}
+        accessibilityHint={
+          zeroSlots
+            ? 'Open to check available dates and slots.'
+            : 'Book a consultation with this attorney.'
+        }>
         <Text style={styles.bookButtonText}>Book Now</Text>
       </TouchableOpacity>
 
@@ -122,107 +148,128 @@ const AttorneyCard = ({item, navigation}) => (
         activeOpacity={0.88}
         onPress={() =>
           navigation.navigate('AttorneyProfile', {
-            attorney: {
-              ...item,
-              reviews: '128',
-              isVerified: item.isVerified,
-            },
+            attorney: item,
           })
         }>
         <Text style={styles.profileButtonText}>View Profile</Text>
       </TouchableOpacity>
     </View>
-  </View>
-);
+  );
+};
 
 export default function BookAppointment({navigation}) {
   const [attorneys, setAttorneys] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const disposedRef = useRef(false);
 
-  const mapRecords = useCallback(records => {
-    return (Array.isArray(records) ? records : []).map(record => {
-      const name =
-        (record.cms_display_name && String(record.cms_display_name).trim()) ||
-        record.full_name ||
-        record.email ||
-        'Attorney';
-      const rawUrl = String(
-        record.cms_profile_image_url || record.avatar_url || '',
-      ).trim();
-      const avg = record.avg_rating;
-      const ratingNum =
-        avg != null && Number.isFinite(Number(avg)) ? Number(avg) : null;
-      const slots = Number(record.open_slots_count) || 0;
-      const ratingLine = `★ ${ratingNum != null ? ratingNum.toFixed(1) : '5.0'} - ${slots} slot${slots === 1 ? '' : 's'} open`;
-      const feeNum = Number(record.consultation_fee);
-      const price = Number.isFinite(feeNum)
-        ? `PHP ${feeNum.toLocaleString(undefined, {
-            minimumFractionDigits: 2,
-            maximumFractionDigits: 2,
-          })}`
-        : 'PHP 2,500.00';
-
-      return {
-        id: record.id,
-        name,
-        specialty: formatSpecialties(record.specialties),
-        experience: record.years_experience
-          ? `${record.years_experience} years experience`
-          : 'Experience not set',
-        ratingLine,
-        price,
-        avatarUri: rawUrl || null,
-        /** Alias for screens expecting `image` (e.g. AttorneyProfile). */
-        image: rawUrl || null,
-        isVerified: Boolean(record.is_verified),
-      };
-    });
+  const mapWebAttorneys = useCallback(rows => {
+    return (Array.isArray(rows) ? rows : []).map(row => ({
+      ...row,
+      specialty: row.specialty || row.specialties?.[0] || 'General Practice',
+      img: row.img,
+      image: row.img,
+      avatarUri: row.img,
+      verified: Boolean(row.verified),
+      isVerified: Boolean(row.verified),
+    }));
   }, []);
 
-  const loadAttorneys = useCallback(async () => {
+  const loadAttorneys = useCallback(async (options = {}) => {
+    const silent = Boolean(options?.silent);
     let usedCache = false;
+
     try {
-      const raw = await AsyncStorage.getItem(ATTORNEYS_CACHE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (
-          parsed?.data &&
-          Array.isArray(parsed.data) &&
-          parsed.data.length > 0 &&
-          Date.now() - (parsed.ts || 0) < ATTORNEYS_CACHE_TTL_MS
-        ) {
-          setAttorneys(parsed.data);
-          setLoading(false);
-          usedCache = true;
-        }
-      }
-      if (!usedCache) {
+      if (!silent) {
         setLoading(true);
       }
 
-      const records = await getAttorneys();
-      const mapped = mapRecords(records);
+      if (!silent) {
+        const raw = await AsyncStorage.getItem(ATTORNEYS_CACHE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (
+            parsed?.data &&
+            Array.isArray(parsed.data) &&
+            parsed.data.length > 0 &&
+            Date.now() - (parsed.ts || 0) < ATTORNEYS_CACHE_TTL_MS
+          ) {
+            setAttorneys(parsed.data);
+            setLoading(false);
+            usedCache = true;
+          }
+        }
+      }
+
+      const rows = await fetchBookableAttorneys({concern: '', onlyVerified: false});
+      if (disposedRef.current) return;
+
+      const mapped = mapWebAttorneys(rows);
       setAttorneys(mapped);
+      setLoadError('');
       await AsyncStorage.setItem(
         ATTORNEYS_CACHE_KEY,
         JSON.stringify({ts: Date.now(), data: mapped}),
       );
     } catch (error) {
-      if (!usedCache) {
-        Alert.alert('Error', error?.message ?? 'Failed to load attorneys.');
+      if (disposedRef.current) return;
+      const message = error?.message ?? 'Unable to load attorneys.';
+      setLoadError(message);
+      if (!silent && !usedCache) {
         setAttorneys([]);
       }
     } finally {
-      setLoading(false);
+      if (!disposedRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  }, [mapRecords]);
+  }, [mapWebAttorneys]);
 
   useEffect(() => {
+    disposedRef.current = false;
     loadAttorneys();
+
+    const pollId = setInterval(() => {
+      loadAttorneys({silent: true});
+    }, ATTORNEYS_POLL_MS);
+
+    const unsubscribeSlots = subscribeToAvailabilitySlots(() => {
+      loadAttorneys({silent: true});
+    });
+
+    return () => {
+      disposedRef.current = true;
+      clearInterval(pollId);
+      unsubscribeSlots();
+    };
   }, [loadAttorneys]);
 
-  return (
-    <ClientScreenShell>
+  useFocusEffect(
+    useCallback(() => {
+      loadAttorneys({silent: true});
+    }, [loadAttorneys]),
+  );
+
+  const handleRefresh = useCallback(() => {
+    setRefreshing(true);
+    loadAttorneys({silent: true});
+  }, [loadAttorneys]);
+
+  const handleBookNow = useCallback(
+    async item => {
+      try {
+        navigation.navigate('BookNow', {attorney: item});
+      } catch (e) {
+        Alert.alert('Error', e?.message ?? 'Could not start booking.');
+      }
+    },
+    [navigation],
+  );
+
+  const listHeader = (
+    <>
       <ClientFadeIn>
         <View style={styles.header}>
           <View style={styles.titleRow}>
@@ -241,41 +288,61 @@ export default function BookAppointment({navigation}) {
         </View>
       </ClientFadeIn>
 
-      {loading ? (
-        <View style={styles.emptyContainer}>
-          <ActivityIndicator color={T.gold[1]} />
-          <Text style={styles.emptyText}>Loading attorney directory...</Text>
+      {loadError ? (
+        <View style={styles.errorBanner}>
+          <Text style={styles.errorBannerText}>{loadError}</Text>
         </View>
-      ) : attorneys.length === 0 ? (
-        <View style={styles.emptyContainer}>
-          <Text style={styles.emptyText}>No attorneys found yet.</Text>
+      ) : null}
+
+      {loading && attorneys.length === 0 ? (
+        <View style={styles.inlineLoading}>
+          <ActivityIndicator color={T.gold[1]} size="small" />
+          <Text style={styles.inlineLoadingText}>Loading attorneys...</Text>
         </View>
-      ) : (
-        <FlatList
-          style={styles.listFlex}
-          data={attorneys}
-          keyExtractor={item => item.id}
-          renderItem={({item, index}) => (
-            <ClientFadeIn delay={80 + index * 50}>
-              <AttorneyCard item={item} navigation={navigation} />
-            </ClientFadeIn>
-          )}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          initialNumToRender={8}
-          maxToRenderPerBatch={10}
-          windowSize={7}
-          removeClippedSubviews
-        />
-      )}
+      ) : null}
+    </>
+  );
+
+  const listEmpty =
+    !loading && !loadError ? (
+      <View style={styles.emptyContainer}>
+        <Text style={styles.emptyText}>No attorneys found yet.</Text>
+      </View>
+    ) : null;
+
+  return (
+    <ClientScreenShell>
+      <FlatList
+        style={styles.listFlex}
+        data={attorneys}
+        keyExtractor={item => String(item.id)}
+        ListHeaderComponent={listHeader}
+        ListEmptyComponent={listEmpty}
+        renderItem={({item, index}) => (
+          <ClientFadeInSoft delay={80 + index * 50}>
+            <AttorneyCard item={item} navigation={navigation} onBookNow={handleBookNow} />
+          </ClientFadeInSoft>
+        )}
+        contentContainerStyle={styles.listContent}
+        showsVerticalScrollIndicator={false}
+        initialNumToRender={6}
+        maxToRenderPerBatch={8}
+        windowSize={7}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            tintColor={T.gold[1]}
+            colors={[T.gold[1]]}
+          />
+        }
+      />
     </ClientScreenShell>
   );
 }
 
 const styles = StyleSheet.create({
-  listFlex: {
-    flex: 1,
-  },
+  listFlex: {flex: 1},
   header: {
     paddingHorizontal: 20,
     paddingTop: 12,
@@ -305,42 +372,58 @@ const styles = StyleSheet.create({
     marginLeft: SUBTITLE_INDENT,
     lineHeight: 20,
   },
-  listContent: {
-    paddingHorizontal: 20,
-    paddingBottom: 20,
+  errorBanner: {
+    marginHorizontal: 20,
+    marginBottom: 12,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: 'rgba(239, 68, 68, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(239, 68, 68, 0.35)',
   },
-  emptyContainer: {
-    flex: 1,
+  errorBannerText: {
+    color: '#FCA5A5',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  inlineLoading: {
+    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 10,
+    paddingVertical: 12,
+    marginBottom: 8,
+  },
+  inlineLoadingText: {
+    color: T.textSoft,
+    fontSize: 14,
+  },
+  listContent: {
+    paddingHorizontal: 20,
+    paddingBottom: 24,
+    flexGrow: 1,
+  },
+  emptyContainer: {
+    alignItems: 'center',
+    paddingVertical: 32,
     paddingHorizontal: 20,
   },
-  emptyText: {marginTop: 8, color: T.textSoft, fontSize: 14, textAlign: 'center'},
+  emptyText: {color: T.textSoft, fontSize: 14, textAlign: 'center'},
   card: {
-    backgroundColor: 'rgba(15, 23, 42, 0.92)',
+    backgroundColor: 'rgba(18, 26, 36, 0.92)',
     borderRadius: 16,
-    paddingVertical: 22,
+    paddingVertical: 24,
     paddingHorizontal: 20,
     marginBottom: 16,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(148, 163, 184, 0.18)',
-    shadowColor: '#000',
-    shadowOffset: {width: 0, height: 8},
-    shadowOpacity: 0.35,
-    shadowRadius: 16,
-    elevation: 4,
-  },
-  profileContainer: {
-    marginBottom: 14,
+    borderColor: 'rgba(244, 215, 139, 0.14)',
   },
   avatar: {
-    width: 108,
-    height: 108,
-    borderRadius: 54,
+    borderWidth: 3,
+    borderColor: 'rgba(244, 215, 139, 0.35)',
     backgroundColor: 'rgba(255,255,255,0.06)',
-    borderWidth: 2,
-    borderColor: 'rgba(148, 163, 184, 0.25)',
+    marginBottom: 12,
   },
   avatarPlaceholder: {
     justifyContent: 'center',
@@ -349,12 +432,8 @@ const styles = StyleSheet.create({
   },
   avatarInitials: {
     color: T.gold[0],
-    fontSize: 32,
+    fontSize: 28,
     fontWeight: '800',
-  },
-  infoContainer: {
-    alignItems: 'center',
-    width: '100%',
   },
   nameRow: {
     flexDirection: 'row',
@@ -380,8 +459,8 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     paddingHorizontal: 8,
     gap: 6,
+    maxWidth: '100%',
   },
-  specialtyIcon: {marginTop: 1},
   specialtyText: {
     fontSize: 13,
     color: T.textMuted,
@@ -392,45 +471,41 @@ const styles = StyleSheet.create({
   experienceText: {
     fontSize: 12,
     color: T.textSoft,
-    marginBottom: 10,
+    marginBottom: 8,
     fontWeight: '500',
   },
   ratingLine: {
     fontSize: 14,
-    fontWeight: '600',
-    color: T.text,
-    marginBottom: 14,
+    fontWeight: '700',
+    color: T.gold[0],
+    marginBottom: 12,
     letterSpacing: 0.2,
   },
   priceText: {
-    fontSize: 26,
+    fontSize: 22,
     fontWeight: '800',
     color: T.text,
-    marginBottom: 18,
-    letterSpacing: 0.3,
+    marginBottom: 16,
   },
   bookButton: {
-    backgroundColor: '#0f172a',
+    backgroundColor: T.gold[1],
     width: '100%',
     paddingVertical: 14,
     borderRadius: 10,
     alignItems: 'center',
     marginBottom: 10,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
   },
   bookButtonText: {
-    color: T.text,
-    fontWeight: '700',
+    color: T.base,
+    fontWeight: '800',
     fontSize: 16,
-    letterSpacing: 0.3,
   },
   profileButton: {
     width: '100%',
     paddingVertical: 14,
     borderRadius: 10,
     borderWidth: 1.5,
-    borderColor: 'rgba(255,255,255,0.42)',
+    borderColor: 'rgba(244, 215, 139, 0.35)',
     alignItems: 'center',
     backgroundColor: 'transparent',
   },
@@ -438,6 +513,5 @@ const styles = StyleSheet.create({
     color: T.text,
     fontWeight: '700',
     fontSize: 16,
-    letterSpacing: 0.2,
   },
 });

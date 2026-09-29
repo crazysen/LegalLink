@@ -17,27 +17,17 @@ import {MaterialCommunityIcons} from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import {useUserProfile} from '../context/UserProfileContext';
 import {
-  formatScheduledAtDisplay,
-  getEffectiveAppointmentStatus,
-  getMyAppointments,
-  isAppointmentCompleted,
-  isAttorneyQueueItem,
-  isUpcomingBySchedule,
-  parseAppointmentScheduleMs,
-} from '../services/appointmentService';
+  fetchAttorneyDashboardSnapshot,
+  fetchAttorneyProfile,
+  getCurrentSessionProfile,
+  isConsultationChatWindowOpen,
+  prefetchAttorneyProfileStats,
+} from '../services/userApi';
 import {getMyProfile} from '../services/profileService';
+import {useAttorneyLiveRefresh} from '../hooks/useAttorneyLiveRefresh';
 import {getGreetingName} from '../utils/userDisplayName';
 import {ClientScreenShell} from '../components/ClientScreenShell';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
-
-function resolveScheduleValue(item) {
-  return (
-    item?.scheduled_at ||
-    item?.updated_at ||
-    item?.created_at ||
-    null
-  );
-}
 
 const glassBorder = 'rgba(244, 215, 139, 0.2)';
 const accentGold = T.gold[1];
@@ -47,7 +37,12 @@ const AttorneyDashboard = ({navigation}) => {
   const isSmallScreen = width < 380;
   const {profile, updateProfile} = useUserProfile();
 
+  const [attorneyId, setAttorneyId] = useState(null);
   const [appointments, setAppointments] = useState([]);
+  const [unreadNotificationCount, setUnreadNotificationCount] = useState(0);
+  const [pendingRequestCount, setPendingRequestCount] = useState(0);
+  const [upcomingCount, setUpcomingCount] = useState(0);
+  const [myAppointmentCount, setMyAppointmentCount] = useState(0);
   const [loading, setLoading] = useState(true);
 
   const upcomingPulseAnim = useRef(new Animated.Value(1)).current;
@@ -96,24 +91,45 @@ const AttorneyDashboard = ({navigation}) => {
     upcomingPressScale,
   );
 
-  const loadDashboard = useCallback(async () => {
+  const loadDashboard = useCallback(async (options = {}) => {
+    const silent = Boolean(options?.silent);
+    if (!silent) setLoading(true);
     try {
-      setLoading(true);
-      const rows = await getMyAppointments();
-      setAppointments(Array.isArray(rows) ? rows : []);
+      const {profile} = await getCurrentSessionProfile();
+      const userId = profile?.id;
+      setAttorneyId(userId || null);
+      if (userId) {
+        void fetchAttorneyProfile(userId, {includeStats: false}).then(() => {
+          void prefetchAttorneyProfileStats(userId);
+        });
+      }
+      if (!userId) {
+        setAppointments([]);
+        setUnreadNotificationCount(0);
+        setPendingRequestCount(0);
+        return;
+      }
+      const snapshot = await fetchAttorneyDashboardSnapshot(userId, options);
+      setAppointments(Array.isArray(snapshot.appointments) ? snapshot.appointments : []);
+      setUnreadNotificationCount(snapshot.unreadNotificationCount || 0);
+      setPendingRequestCount(snapshot.pendingRequestCount || 0);
+      setUpcomingCount(snapshot.upcomingCount || 0);
+      setMyAppointmentCount(snapshot.myAppointmentCount || 0);
     } catch (error) {
-      Alert.alert('Error', error?.message ?? 'Failed to load dashboard data.');
+      if (!silent) {
+        Alert.alert('Error', error?.message ?? 'Failed to load dashboard data.');
+      }
       setAppointments([]);
+      setUnreadNotificationCount(0);
+      setPendingRequestCount(0);
+      setUpcomingCount(0);
+      setMyAppointmentCount(0);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
-  useFocusEffect(
-    useCallback(() => {
-      loadDashboard();
-    }, [loadDashboard]),
-  );
+  useAttorneyLiveRefresh({attorneyId, reload: loadDashboard});
 
   useFocusEffect(
     useCallback(() => {
@@ -145,35 +161,34 @@ const AttorneyDashboard = ({navigation}) => {
     }, [updateProfile]),
   );
 
-  const {upcomingCount, recentConsultations} = useMemo(() => {
-    const now = new Date();
-    const upcomingList = appointments.filter(
-      item =>
-        !isAppointmentCompleted(item) &&
-        isAttorneyQueueItem(item) &&
-        isUpcomingBySchedule(item, now),
-    );
-    upcomingList.sort((a, b) => {
-      const ma = parseAppointmentScheduleMs(a);
-      const mb = parseAppointmentScheduleMs(b);
-      const fa = ma ?? Number.MAX_SAFE_INTEGER;
-      const fb = mb ?? Number.MAX_SAFE_INTEGER;
-      return fa - fb;
+  const {nextConsultation, recentConsultations} = useMemo(() => {
+    const now = Date.now();
+    const futureAppointments = appointments.filter(item => {
+      const scheduledMs = new Date(item.scheduledAt || 0).getTime();
+      return Number.isFinite(scheduledMs) && scheduledMs >= now;
     });
-    const recent = upcomingList.slice(0, 3).map(item => {
-      const {date, time} = formatScheduledAtDisplay(resolveScheduleValue(item));
-      const s = getEffectiveAppointmentStatus(item);
-      return {
-        id: item.id,
-        name: item.client_name || 'Client',
-        type: item.title || 'Consultation',
-        time: time === '—' ? '--:--' : time,
-        date: date === '—' ? 'No schedule' : date,
-        status: s.toUpperCase(),
-        initial: (item.client_name || 'C').trim()[0]?.toUpperCase() || 'C',
-      };
+    const sorted = [...futureAppointments].sort((a, b) => {
+      const aTime = new Date(a.scheduledAt || 0).getTime() || 0;
+      const bTime = new Date(b.scheduledAt || 0).getTime() || 0;
+      return aTime - bTime;
     });
-    return {upcomingCount: upcomingList.length, recentConsultations: recent};
+    const recent = sorted.slice(0, 3).map(item => ({
+      id: item.id,
+      name: item.name || 'Client',
+      type: item.area || 'Consultation',
+      time: item.time || '--:--',
+      date: item.date || 'No schedule',
+      status: String(item.status || 'pending').toUpperCase(),
+      initial: (item.initials || 'C').trim()[0]?.toUpperCase() || 'C',
+      scheduledAt: item.scheduledAt,
+      slotDate: item.slotDate,
+      slotTime: item.slotTime,
+      paymentStatus: item.paymentStatus,
+    }));
+    return {
+      nextConsultation: sorted[0] || null,
+      recentConsultations: recent,
+    };
   }, [appointments]);
 
   const greetingName = getGreetingName(profile);
@@ -209,62 +224,110 @@ const AttorneyDashboard = ({navigation}) => {
       <ScrollView
         showsVerticalScrollIndicator={false}
         contentContainerStyle={[styles.scrollContent, isSmallScreen && styles.scrollContentSmall]}>
-        <View style={styles.welcomeBox}>
-          <Text style={[styles.welcomeText, isSmallScreen && styles.welcomeTextSmall]} numberOfLines={2}>
-            {greetingName
-              ? `Welcome back, Atty. ${greetingName}`
-              : 'Welcome back, Attorney'}
-          </Text>
-          <Text style={styles.subtitle}>
-            Here&apos;s what&apos;s happening with your practice today.
-          </Text>
+        <View style={styles.heroGrid}>
+          <View style={styles.welcomeBox}>
+            <Text style={styles.kicker}>LEGAL OPERATIONS OVERVIEW</Text>
+            <Text style={[styles.welcomeText, isSmallScreen && styles.welcomeTextSmall]} numberOfLines={2}>
+              {greetingName
+                ? `Welcome back, Atty. ${greetingName}`
+                : 'Welcome back, Attorney'}
+            </Text>
+            <Text style={styles.subtitle}>
+              Monitor consultations, respond faster, and keep your schedule aligned in one focused dashboard.
+            </Text>
+            <View style={styles.heroChips}>
+              <View style={styles.heroChip}>
+                <Text style={styles.heroChipText}>
+                  {loading ? '--' : upcomingCount} upcoming consultations
+                </Text>
+              </View>
+              <View style={styles.heroChip}>
+                <Text style={styles.heroChipText}>
+                  {loading ? '--' : unreadNotificationCount} unread notifications
+                </Text>
+              </View>
+              {pendingRequestCount > 0 ? (
+                <TouchableOpacity
+                  style={[styles.heroChip, styles.heroChipAction]}
+                  onPress={() => {
+                    Haptics.selectionAsync();
+                    navigation.navigate('AttyConsultationRequests');
+                  }}>
+                  <Text style={styles.heroChipActionText}>
+                    {pendingRequestCount} pending request{pendingRequestCount === 1 ? '' : 's'}
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          </View>
+
+          <LinearGradient
+            colors={['rgba(18,28,44,0.95)', 'rgba(12,19,30,0.88)']}
+            style={styles.spotlightCard}>
+            <View style={styles.spotlightHeader}>
+              <Text style={styles.spotlightTitle}>Next Consultation</Text>
+              <MaterialCommunityIcons name="scale-balance" size={20} color={accentGold} />
+            </View>
+            {nextConsultation ? (
+              <>
+                <Text style={styles.spotlightName} numberOfLines={1}>
+                  {nextConsultation.name || 'Client'}
+                </Text>
+                <Text style={styles.spotlightMeta} numberOfLines={2}>
+                  {nextConsultation.area || 'Consultation'}
+                </Text>
+                <Text style={styles.spotlightMeta}>
+                  {nextConsultation.date || 'No date'} at {nextConsultation.time || '--:--'}
+                </Text>
+              </>
+            ) : (
+              <Text style={styles.spotlightEmpty}>No scheduled consultation yet.</Text>
+            )}
+          </LinearGradient>
         </View>
 
-        <TouchableOpacity
-          activeOpacity={0.88}
-          onPress={() => {
-            Haptics.selectionAsync();
-            navigation.navigate('AttyAvailabilityManager');
-          }}
-          style={styles.actionCard}>
-          <LinearGradient
-            colors={['rgba(14,20,30,0.92)', 'rgba(18,26,36,0.75)']}
-            style={styles.actionGradient}>
-            <View style={styles.actionIconBox}>
-              <MaterialCommunityIcons name="calendar-clock" size={22} color={accentGold} />
-            </View>
-            <Text style={styles.actionText}>Manage Availability</Text>
-            <MaterialCommunityIcons name="chevron-right" size={22} color={T.textMuted} />
-          </LinearGradient>
-        </TouchableOpacity>
+        <View style={styles.statsRow}>
+          <Pressable
+            onPressIn={handleUpcomingPressIn}
+            onPressOut={handleUpcomingPressOut}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+              navigation.navigate('AttyMyAppointments');
+            }}
+            style={styles.statCardWrap}>
+            <Animated.View style={{transform: [{scale: upcomingCombinedScale}], flex: 1}}>
+              <LinearGradient
+                colors={['rgba(18,28,44,0.95)', 'rgba(12,19,30,0.88)']}
+                style={styles.statCard}>
+                <View style={[styles.gridIcon, {backgroundColor: 'rgba(54, 74, 110, 0.35)'}]}>
+                  <MaterialCommunityIcons name="calendar-check" size={22} color="#60A5FA" />
+                </View>
+                <Text style={styles.gridLabel}>MY APPOINTMENTS</Text>
+                <Text style={[styles.gridValue, isSmallScreen && styles.gridValueSmall]}>
+                  {loading ? '--' : myAppointmentCount}
+                </Text>
+              </LinearGradient>
+            </Animated.View>
+          </Pressable>
 
-        <Pressable
-          onPressIn={handleUpcomingPressIn}
-          onPressOut={handleUpcomingPressOut}
-          onPress={() => {
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-            navigation.navigate('AttyMyAppointments');
-          }}
-          style={styles.singleStatWrap}>
-          <Animated.View
-            style={[
-              styles.upcomingAnimatedOuter,
-              {transform: [{scale: upcomingCombinedScale}]},
-            ]}>
+          <TouchableOpacity
+            activeOpacity={0.88}
+            onPress={() => {
+              Haptics.selectionAsync();
+              navigation.navigate('AttyAnalytics');
+            }}
+            style={styles.statCardWrap}>
             <LinearGradient
-              colors={['rgba(18,28,44,0.95)', 'rgba(12,19,30,0.88)']}
-              style={styles.singleStatCard}>
-              <View style={[styles.gridIcon, {backgroundColor: 'rgba(54, 74, 110, 0.35)'}]}>
-                <MaterialCommunityIcons name="calendar-month" size={22} color={accentGold} />
+              colors={['rgba(14,26,22,0.95)', 'rgba(12,19,30,0.88)']}
+              style={styles.statCard}>
+              <View style={[styles.gridIcon, {backgroundColor: 'rgba(16, 185, 129, 0.2)'}]}>
+                <MaterialCommunityIcons name="chart-bar" size={22} color="#34D399" />
               </View>
-              <Text style={styles.gridLabel}>UPCOMING APPOINTMENTS</Text>
-              <Text style={[styles.gridValue, isSmallScreen && styles.gridValueSmall]}>
-                {loading ? '--' : upcomingCount}
-              </Text>
-              <Text style={styles.gridHint}>Tap to view and manage</Text>
+              <Text style={styles.gridLabel}>ANALYTICS</Text>
+              <Text style={styles.analyticsValue}>View Graph</Text>
             </LinearGradient>
-          </Animated.View>
-        </Pressable>
+          </TouchableOpacity>
+        </View>
 
         <View style={styles.sectionCard}>
           <View style={styles.sectionHeader}>
@@ -287,12 +350,22 @@ const AttorneyDashboard = ({navigation}) => {
               <Text style={styles.emptyText}>No consultations yet.</Text>
             </View>
           ) : (
-            recentConsultations.map(item => (
+            recentConsultations.map(item => {
+              const canEnter = isConsultationChatWindowOpen({
+                status: item.status,
+                scheduledAt: item.scheduledAt,
+                slotDate: item.slotDate,
+                slotTime: item.slotTime,
+                paymentStatus: item.paymentStatus || 'unpaid',
+              });
+              return (
               <TouchableOpacity
                 key={item.id}
                 style={styles.consultItem}
                 activeOpacity={0.88}
+                disabled={!canEnter}
                 onPress={() => {
+                  if (!canEnter) return;
                   Haptics.selectionAsync();
                   navigation.navigate('AttyConsultationMessage', {
                     chatId: item.id,
@@ -323,30 +396,11 @@ const AttorneyDashboard = ({navigation}) => {
                   <Text style={styles.consultTime}>{item.time}</Text>
                 </View>
               </TouchableOpacity>
-            ))
+            );
+            })
           )}
         </View>
 
-        <LinearGradient
-          colors={['rgba(9,13,21,0.95)', 'rgba(14,20,31,0.88)']}
-          style={styles.promoCard}>
-          <Text style={[styles.promoTitle, isSmallScreen && styles.promoTitleSmall]}>
-            Grow your law{'\n'}practice
-          </Text>
-          <Text style={styles.promoDesc}>
-            Keep your availability updated so clients can book paid consultations in your open slots.
-          </Text>
-          <TouchableOpacity
-            onPress={() => {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-              navigation.navigate('AttyAvailabilityManager');
-            }}
-            activeOpacity={0.9}>
-            <LinearGradient colors={[T.gold[0], T.gold[1]]} style={styles.promoButton}>
-              <Text style={styles.promoButtonText}>Manage My Schedule</Text>
-            </LinearGradient>
-          </TouchableOpacity>
-        </LinearGradient>
       </ScrollView>
     </ClientScreenShell>
   );
@@ -392,49 +446,64 @@ const styles = StyleSheet.create({
   },
   scrollContent: {padding: 20, paddingBottom: 40},
   scrollContentSmall: {paddingHorizontal: 14},
+  heroGrid: {gap: 14, marginBottom: 16},
   welcomeBox: {
-    marginBottom: 20,
     padding: 18,
     borderRadius: 18,
     backgroundColor: 'rgba(14, 20, 31, 0.55)',
     borderWidth: 1,
     borderColor: 'rgba(244, 215, 139, 0.08)',
   },
+  kicker: {
+    color: accentGold,
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+    marginBottom: 8,
+  },
   welcomeText: {color: T.text, fontSize: 24, fontWeight: '900'},
   welcomeTextSmall: {fontSize: 21},
-  subtitle: {color: T.textMuted, fontSize: 14, marginTop: 6},
-  actionCard: {
-    borderRadius: 20,
-    overflow: 'hidden',
+  subtitle: {color: T.textMuted, fontSize: 14, marginTop: 6, lineHeight: 20},
+  heroChips: {flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 14},
+  heroChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.05)',
     borderWidth: 1,
-    borderColor: 'rgba(186, 154, 91, 0.24)',
-    marginBottom: 20,
+    borderColor: 'rgba(244, 215, 139, 0.12)',
   },
-  actionGradient: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  heroChipText: {color: T.textSoft, fontSize: 11, fontWeight: '700'},
+  heroChipAction: {
+    borderColor: 'rgba(244, 215, 139, 0.35)',
+    backgroundColor: 'rgba(215, 177, 74, 0.12)',
+  },
+  heroChipActionText: {color: accentGold, fontSize: 11, fontWeight: '800'},
+  spotlightCard: {
+    borderRadius: 18,
     padding: 18,
+    borderWidth: 1,
+    borderColor: glassBorder,
   },
-  actionIconBox: {
-    width: 40,
-    height: 40,
-    borderRadius: 12,
-    backgroundColor: 'rgba(215, 177, 74, 0.1)',
-    justifyContent: 'center',
+  spotlightHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
-    marginRight: 14,
+    marginBottom: 10,
   },
-  actionText: {flex: 1, color: T.text, fontSize: 16, fontWeight: '800'},
-  singleStatWrap: {marginBottom: 8},
-  upcomingAnimatedOuter: {
-    borderRadius: 24,
-    overflow: 'hidden',
-  },
-  singleStatCard: {
+  spotlightTitle: {color: T.text, fontSize: 14, fontWeight: '900'},
+  spotlightName: {color: T.text, fontSize: 18, fontWeight: '900'},
+  spotlightMeta: {color: T.textMuted, fontSize: 13, marginTop: 4},
+  spotlightEmpty: {color: T.textMuted, fontSize: 13},
+  statsRow: {flexDirection: 'row', gap: 12, marginBottom: 8},
+  statCardWrap: {flex: 1},
+  statCard: {
+    flex: 1,
     borderRadius: 24,
     padding: 22,
     borderWidth: 1,
     borderColor: glassBorder,
+    minHeight: 150,
   },
   gridIcon: {
     width: 40,
@@ -452,7 +521,7 @@ const styles = StyleSheet.create({
   },
   gridValue: {color: T.text, fontSize: 36, fontWeight: '900', marginTop: 6},
   gridValueSmall: {fontSize: 30},
-  gridHint: {color: T.textSoft, fontSize: 12, marginTop: 8},
+  analyticsValue: {color: T.text, fontSize: 18, fontWeight: '900', marginTop: 10},
   sectionCard: {
     marginTop: 18,
     borderRadius: 24,
@@ -503,23 +572,6 @@ const styles = StyleSheet.create({
   },
   statusText: {color: accentGold, fontSize: 9, fontWeight: '900'},
   consultTime: {color: T.textMuted, fontSize: 10, marginTop: 8},
-  promoCard: {
-    marginTop: 20,
-    padding: 24,
-    borderRadius: 28,
-    borderWidth: 1,
-    borderColor: 'rgba(180, 146, 82, 0.2)',
-  },
-  promoTitle: {color: T.text, fontSize: 22, fontWeight: '900'},
-  promoTitleSmall: {fontSize: 19},
-  promoDesc: {color: '#9AA6BC', fontSize: 13, lineHeight: 20, marginTop: 12, marginBottom: 18},
-  promoButton: {
-    height: 52,
-    borderRadius: 20,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  promoButtonText: {color: '#101B2C', fontSize: 16, fontWeight: '900'},
 });
 
 export default AttorneyDashboard;

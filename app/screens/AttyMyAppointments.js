@@ -1,8 +1,9 @@
-import React, {useCallback, useState} from 'react';
-import {useFocusEffect} from '@react-navigation/native';
+import React, {useCallback, useMemo, useState} from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Linking,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -10,250 +11,232 @@ import {
   View,
 } from 'react-native';
 import {LinearGradient} from 'expo-linear-gradient';
-import {MaterialCommunityIcons} from '@expo/vector-icons';
-import {
-  formatAppointmentNotesForDisplay,
-  getEffectiveAppointmentStatus,
-  getMyAppointments,
-  isAppointmentCompleted,
-  isUpcomingBySchedule,
-  parseAppointmentScheduleMs,
-  updateAppointmentStatus,
-} from '../services/appointmentService';
+import AttorneyScreenHeader from '../components/AttorneyScreenHeader';
 import {ClientScreenShell} from '../components/ClientScreenShell';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
+import {
+  fetchAttorneyUpcomingAppointments,
+  getCurrentSessionProfile,
+  isConsultationChatWindowOpen,
+} from '../services/userApi';
+import {useAttorneyLiveRefresh} from '../hooks/useAttorneyLiveRefresh';
 
 const accentGold = T.gold[1];
 
-function resolveScheduleValue(item) {
-  return (
-    item?.scheduled_at ||
-    item?.updated_at ||
-    item?.created_at ||
-    null
-  );
-}
+function groupAppointments(appointments) {
+  const now = new Date();
+  const todayDate = now.toDateString();
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  const tomorrowDate = tomorrow.toDateString();
+  const currentYear = now.getFullYear();
 
-function formatDateTime(isoDateTime) {
-  if (!isoDateTime) {
-    return {date: 'No schedule', time: '--:--'};
-  }
+  const today = [];
+  const nextDay = [];
+  const week = [];
 
-  const rawValue = String(isoDateTime).trim();
-  const hasTimezoneInfo = /([zZ]|[+-]\d{2}:?\d{2})$/.test(rawValue);
-
-  let value;
-  if (hasTimezoneInfo) {
-    const normalizedValue = rawValue
-      .replace(' ', 'T')
-      .replace(/\+00$/, 'Z');
-    value = new Date(normalizedValue);
-  } else {
-    const localMatch = rawValue.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
-    if (localMatch) {
-      value = new Date(
-        Number(localMatch[1]),
-        Number(localMatch[2]) - 1,
-        Number(localMatch[3]),
-        Number(localMatch[4]),
-        Number(localMatch[5]),
-      );
-    } else {
-      value = new Date(rawValue);
+  appointments.forEach(appointment => {
+    const parsed = new Date(appointment.scheduledAt || `${appointment.date} ${currentYear}`);
+    if (Number.isNaN(parsed.getTime())) {
+      week.push(appointment);
+      return;
     }
-  }
+    const apptDate = parsed.toDateString();
+    if (apptDate === todayDate) {
+      today.push(appointment);
+    } else if (apptDate === tomorrowDate) {
+      nextDay.push(appointment);
+    } else {
+      week.push(appointment);
+    }
+  });
 
-  if (!value || Number.isNaN(value.getTime())) {
-    return {date: 'No schedule', time: '--:--'};
-  }
+  const sortBySchedule = rows =>
+    rows.slice().sort((a, b) => {
+      const aTime = new Date(a.scheduledAt || 0).getTime() || 0;
+      const bTime = new Date(b.scheduledAt || 0).getTime() || 0;
+      return aTime - bTime;
+    });
 
   return {
-    date: value.toLocaleDateString(),
-    time: value.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}),
+    todayAppts: today,
+    tomorrowAppts: sortBySchedule(nextDay),
+    weekAppts: sortBySchedule(week),
   };
-}
-
-function sortUpcomingNearestFirst(list) {
-  return [...list].sort((a, b) => {
-    const ma = parseAppointmentScheduleMs(a);
-    const mb = parseAppointmentScheduleMs(b);
-    const fa = ma ?? Number.MAX_SAFE_INTEGER;
-    const fb = mb ?? Number.MAX_SAFE_INTEGER;
-    return fa - fb;
-  });
 }
 
 export default function AttyMyAppointments({navigation}) {
+  const [attorneyId, setAttorneyId] = useState(null);
   const [appointments, setAppointments] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
 
-  const loadAppointments = useCallback(async () => {
+  const loadAppointments = useCallback(async (options = {}) => {
+    const silent = Boolean(options?.silent);
+    if (!silent) setLoading(true);
     try {
-      setLoading(true);
-      const records = await getMyAppointments();
-      const raw = Array.isArray(records) ? records : [];
-      const upcoming = raw.filter(
-        item =>
-          !isAppointmentCompleted(item) && isUpcomingBySchedule(item),
-      );
-      setAppointments(sortUpcomingNearestFirst(upcoming));
+      const {profile} = await getCurrentSessionProfile();
+      const userId = profile?.id;
+      setAttorneyId(userId || null);
+      if (!userId) {
+        setAppointments([]);
+        return;
+      }
+      const rows = await fetchAttorneyUpcomingAppointments(userId, options);
+      setAppointments(Array.isArray(rows) ? rows : []);
+      setLastUpdatedAt(new Date());
     } catch (error) {
-      Alert.alert('Error', error?.message ?? 'Failed to load appointments.');
+      if (!silent) {
+        Alert.alert('Error', error?.message ?? 'Failed to load appointments.');
+      }
       setAppointments([]);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
+      if (silent) setRefreshing(false);
     }
   }, []);
 
-  useFocusEffect(
-    useCallback(() => {
-      loadAppointments();
-    }, [loadAppointments]),
+  useAttorneyLiveRefresh({attorneyId, reload: loadAppointments, pollMs: 10000});
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await loadAppointments({force: true, silent: true});
+  }, [loadAppointments]);
+
+  const lastUpdatedLabel = lastUpdatedAt
+    ? lastUpdatedAt.toLocaleTimeString('en-PH', {hour: 'numeric', minute: '2-digit'})
+    : null;
+
+  const {todayAppts, tomorrowAppts, weekAppts} = useMemo(
+    () => groupAppointments(appointments),
+    [appointments],
   );
 
-  const handleStatusUpdate = async (appointmentId, status) => {
-    try {
-      await updateAppointmentStatus(appointmentId, status);
-      await loadAppointments();
-    } catch (error) {
-      Alert.alert('Error', error?.message ?? 'Unable to update appointment status.');
-    }
+  const renderCard = item => {
+    const canEnter = isConsultationChatWindowOpen({
+      status: item.status,
+      scheduledAt: item.scheduledAt,
+      slotDate: item.slotDate,
+      slotTime: item.slotTime,
+      paymentStatus: item.paymentStatus || 'unpaid',
+    });
+
+    return (
+      <View key={item.id} style={styles.card}>
+        <View style={styles.cardHeader}>
+          <View style={[styles.initialsBox, {backgroundColor: item.color || 'rgba(99,102,241,0.35)'}]}>
+            <Text style={styles.initialsText}>{item.initials}</Text>
+          </View>
+          <View style={styles.cardMain}>
+            <Text style={styles.name}>{item.name}</Text>
+            <Text style={styles.specialty}>{item.area}</Text>
+            <Text style={styles.scheduleText}>
+              {item.date ? `${item.date} • ${item.time}` : item.time}
+            </Text>
+          </View>
+          <View style={styles.statusBadge}>
+            <Text style={styles.statusBadgeText}>{String(item.status || '').toUpperCase()}</Text>
+          </View>
+        </View>
+
+        {item.concern ? <Text style={styles.notesText}>{item.concern}</Text> : null}
+
+        <View style={styles.confirmedActionRow}>
+          {item.attachmentUrl ? (
+            <TouchableOpacity
+              style={styles.fileBtn}
+              onPress={() => Linking.openURL(item.attachmentUrl).catch(() => {})}>
+              <Text style={styles.fileBtnText}>View file</Text>
+            </TouchableOpacity>
+          ) : null}
+          <TouchableOpacity
+            style={styles.rescheduleBtn}
+            onPress={() =>
+              navigation.navigate('RescheduleAppointment', {
+                appointment: {
+                  id: item.id,
+                  attorney_id: attorneyId,
+                  name: item.name,
+                  date: item.date,
+                  time: item.time,
+                  scheduled_at: item.scheduledAt,
+                },
+                returnRoute: 'AttyMyAppointments',
+              })
+            }>
+            <Text style={styles.rescheduleBtnText}>Reschedule</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.consultBtn, !canEnter && styles.consultBtnDisabled]}
+            disabled={!canEnter}
+            onPress={() =>
+              navigation.navigate('AttyConsultationMessage', {
+                chatId: item.id,
+                clientName: item.name,
+                clientInitials: item.initials,
+              })
+            }>
+            <LinearGradient
+              colors={canEnter ? [T.gold[0], T.gold[1]] : ['#4B5563', '#374151']}
+              style={styles.gradBtn}>
+              <Text style={styles.gradBtnText}>Enter Consultation</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
   };
+
+  const renderSection = (title, items) => (
+    <View key={title} style={styles.section}>
+      <View style={styles.sectionHeader}>
+        <Text style={styles.sectionTitle}>{title}</Text>
+        <Text style={styles.sectionCount}>{items.length}</Text>
+      </View>
+      {items.length ? items.map(renderCard) : (
+        <Text style={styles.sectionEmpty}>No appointments in this group.</Text>
+      )}
+    </View>
+  );
 
   return (
     <ClientScreenShell edges={['top']}>
-      <View style={styles.navHeader}>
-        <TouchableOpacity
-          style={styles.backBtn}
-          onPress={() => (navigation.canGoBack() ? navigation.goBack() : null)}>
-          <MaterialCommunityIcons name="chevron-left" size={28} color={T.text} />
-        </TouchableOpacity>
-        <Text style={styles.navTitle}>My Appointments</Text>
-      </View>
+      <AttorneyScreenHeader
+        navigation={navigation}
+        title="Consultation Management"
+        subtitle="My Appointments"
+        activeRoute="AttyMyAppointments"
+      />
 
       <View style={styles.subHeader}>
-        <Text style={styles.subTitle}>Manage and track all your legal appointments</Text>
+        <Text style={styles.subTitle}>Upcoming client consultations sorted by date.</Text>
+        {lastUpdatedLabel ? (
+          <Text style={styles.syncText}>Last synced {lastUpdatedLabel}</Text>
+        ) : null}
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent}>
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={accentGold} />
+        }>
         {loading ? (
           <View style={styles.emptyCard}>
             <ActivityIndicator color={accentGold} />
             <Text style={styles.emptyText}>Loading appointments...</Text>
           </View>
-        ) : appointments.length === 0 ? (
+        ) : !appointments.length ? (
           <View style={styles.emptyCard}>
-            <Text style={styles.emptyTitle}>No appointment requests yet</Text>
-            <Text style={styles.emptyText}>Paid and scheduled consultations will appear here.</Text>
+            <Text style={styles.emptyTitle}>No upcoming appointments</Text>
+            <Text style={styles.emptyText}>Confirmed consultations will appear here.</Text>
           </View>
         ) : (
-          appointments.map(item => {
-            const effective = getEffectiveAppointmentStatus(item);
-            const status = effective.toUpperCase();
-            const {date, time} = formatDateTime(resolveScheduleValue(item));
-            return (
-              <View key={item.id} style={styles.card}>
-                <View style={styles.cardHeader}>
-                  <View>
-                    <Text style={styles.name}>{item.client_name ?? 'Client'}</Text>
-                    <Text style={styles.specialty}>{item.title ?? 'Consultation'}</Text>
-                  </View>
-                  <View style={styles.statusBadge}>
-                    <Text style={styles.statusBadgeText}>{status}</Text>
-                  </View>
-                </View>
-
-                <View style={styles.metaRow}>
-                  <Text style={styles.metaText}>
-                    <MaterialCommunityIcons name="calendar" size={14} color={T.textMuted} /> {date}
-                  </Text>
-                  <Text style={[styles.metaText, {marginLeft: 16}]}>
-                    <MaterialCommunityIcons name="clock-outline" size={14} color={T.textMuted} /> {time}
-                  </Text>
-                </View>
-
-                <Text style={styles.notesText}>
-                  {formatAppointmentNotesForDisplay(item.notes) || 'No notes provided'}
-                </Text>
-
-                {effective === 'pending' && (
-                  <View style={styles.actionRow}>
-                    <TouchableOpacity
-                      style={[styles.actionButton, styles.rejectButton]}
-                      onPress={() => handleStatusUpdate(item.id, 'CANCELLED')}>
-                      <Text style={styles.rejectButtonText}>Reject</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[styles.actionButton, styles.approveButton]}
-                      onPress={() => handleStatusUpdate(item.id, 'CONFIRMED')}>
-                      <Text style={styles.approveButtonText}>Approve</Text>
-                    </TouchableOpacity>
-                  </View>
-                )}
-
-                {status === 'CONFIRMED' && (
-                  <View style={styles.confirmedActionRow}>
-                    <TouchableOpacity
-                      style={[styles.consultBtn, styles.consultBtnHalf]}
-                      onPress={() =>
-                        navigation.navigate('AttyConsultationMessage', {
-                          chatId: item.id,
-                          clientName: item.client_name ?? 'Client',
-                          clientInitials: (item.client_name ?? 'Client')
-                            .split(' ')
-                            .map(part => part[0])
-                            .join('')
-                            .slice(0, 2)
-                            .toUpperCase(),
-                        })
-                      }>
-                      <LinearGradient colors={[T.gold[0], T.gold[1]]} style={styles.gradBtn}>
-                        <Text style={styles.gradBtnText}>Enter Consultation</Text>
-                      </LinearGradient>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={styles.rescheduleBtn}
-                      onPress={() =>
-                        navigation.navigate('RescheduleAppointment', {
-                          appointment: {
-                            id: item.id,
-                            attorney_id: item.attorney_id,
-                            name: item.client_name ?? 'Client',
-                            date,
-                            time,
-                            scheduled_at: item.scheduled_at,
-                          },
-                          returnRoute: 'AttyMyAppointments',
-                        })
-                      }>
-                      <Text style={styles.rescheduleBtnText}>Reschedule</Text>
-                    </TouchableOpacity>
-                  </View>
-                )}
-
-                {status === 'RESCHEDULED' && (
-                  <TouchableOpacity
-                    style={styles.consultBtn}
-                    onPress={() =>
-                      navigation.navigate('AttyConsultationMessage', {
-                        chatId: item.id,
-                        clientName: item.client_name ?? 'Client',
-                        clientInitials: (item.client_name ?? 'Client')
-                          .split(' ')
-                          .map(part => part[0])
-                          .join('')
-                          .slice(0, 2)
-                          .toUpperCase(),
-                      })
-                    }>
-                    <LinearGradient colors={[T.gold[0], T.gold[1]]} style={styles.gradBtn}>
-                      <Text style={styles.gradBtnText}>View Messages</Text>
-                    </LinearGradient>
-                  </TouchableOpacity>
-                )}
-              </View>
-            );
-          })
+          <>
+            {renderSection('Today', todayAppts)}
+            {renderSection('Tomorrow', tomorrowAppts)}
+            {renderSection('This week', weekAppts)}
+          </>
         )}
       </ScrollView>
     </ClientScreenShell>
@@ -261,24 +244,15 @@ export default function AttyMyAppointments({navigation}) {
 }
 
 const styles = StyleSheet.create({
-  navHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(244, 215, 139, 0.08)',
-  },
-  backBtn: {width: 44, height: 44, justifyContent: 'center'},
-  navTitle: {
-    fontSize: 22,
-    fontWeight: '900',
-    color: T.text,
-    marginLeft: 4,
-  },
-  subHeader: {paddingHorizontal: 20, marginTop: 8, marginBottom: 16},
-  subTitle: {color: T.textMuted, fontSize: 14},
+  subHeader: {paddingHorizontal: 20, marginTop: 4, marginBottom: 12},
+  subTitle: {color: T.textMuted, fontSize: 14, lineHeight: 20},
+  syncText: {color: T.textSoft, fontSize: 11, marginTop: 4},
   scrollContent: {paddingHorizontal: 20, paddingBottom: 30},
+  section: {marginBottom: 20},
+  sectionHeader: {flexDirection: 'row', alignItems: 'center', marginBottom: 10},
+  sectionTitle: {fontSize: 16, fontWeight: '900', color: T.text, flex: 1},
+  sectionCount: {color: accentGold, fontWeight: '800', fontSize: 12},
+  sectionEmpty: {color: T.textMuted, fontSize: 13, marginBottom: 8},
   card: {
     backgroundColor: 'rgba(12, 19, 30, 0.92)',
     borderRadius: 20,
@@ -287,59 +261,47 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(244, 215, 139, 0.12)',
   },
-  cardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    marginBottom: 12,
+  cardHeader: {flexDirection: 'row', alignItems: 'flex-start', marginBottom: 8},
+  initialsBox: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
+  initialsText: {color: '#fff', fontWeight: '900'},
+  cardMain: {flex: 1, marginLeft: 12, marginRight: 8},
   name: {fontSize: 18, fontWeight: '800', color: T.text},
-  specialty: {fontSize: 14, color: T.textMuted, marginTop: 2},
+  specialty: {fontSize: 12, color: T.textMuted, marginTop: 2},
+  scheduleText: {fontSize: 12, color: T.textSoft, marginTop: 4},
   statusBadge: {
     backgroundColor: 'rgba(215, 177, 74, 0.15)',
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 8,
   },
-  statusBadgeText: {color: accentGold, fontSize: 10, fontWeight: '800'},
-  metaRow: {flexDirection: 'row', flexWrap: 'wrap', marginBottom: 10},
-  metaText: {color: T.textMuted, fontSize: 13},
-  notesText: {color: T.textSoft, fontSize: 13},
-  actionRow: {flexDirection: 'row', marginTop: 14},
-  actionButton: {
-    flex: 1,
-    height: 44,
+  statusBadgeText: {color: accentGold, fontSize: 9, fontWeight: '800'},
+  notesText: {color: T.textSoft, fontSize: 13, marginBottom: 8},
+  confirmedActionRow: {flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', marginTop: 8, gap: 8},
+  fileBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
     borderRadius: 12,
-    justifyContent: 'center',
-    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.25)',
   },
-  rejectButton: {backgroundColor: 'rgba(254, 226, 226, 0.95)', marginRight: 8},
-  approveButton: {backgroundColor: 'rgba(220, 252, 231, 0.95)'},
-  rejectButtonText: {color: '#B91C1C', fontWeight: '800'},
-  approveButtonText: {color: '#166534', fontWeight: '800'},
-  consultBtn: {
-    marginTop: 14,
-    borderRadius: 12,
-    overflow: 'hidden',
-  },
-  gradBtn: {
-    height: 44,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-  },
-  gradBtnText: {color: '#101B2C', fontWeight: '800'},
-  confirmedActionRow: {flexDirection: 'row', marginTop: 14},
-  consultBtnHalf: {flex: 1, marginTop: 0, marginRight: 8},
+  fileBtnText: {color: accentGold, fontWeight: '800', fontSize: 11},
   rescheduleBtn: {
-    flex: 1,
-    backgroundColor: 'rgba(234, 179, 8, 0.95)',
-    height: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
     borderRadius: 12,
-    justifyContent: 'center',
-    alignItems: 'center',
+    backgroundColor: 'rgba(234, 179, 8, 0.95)',
   },
-  rescheduleBtnText: {color: '#1E293B', fontWeight: '800'},
+  rescheduleBtnText: {color: '#1E293B', fontWeight: '800', fontSize: 11},
+  consultBtn: {flex: 1, minWidth: 140, borderRadius: 12, overflow: 'hidden'},
+  consultBtnDisabled: {opacity: 0.7},
+  gradBtn: {height: 44, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 12},
+  gradBtnText: {color: '#101B2C', fontWeight: '800', fontSize: 12},
   emptyCard: {
     borderWidth: 1,
     borderColor: 'rgba(244, 215, 139, 0.15)',

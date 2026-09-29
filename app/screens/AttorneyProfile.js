@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
+import React from 'react';
 import {
   StyleSheet,
   View,
@@ -6,380 +6,318 @@ import {
   Image,
   ScrollView,
   TouchableOpacity,
-  ActivityIndicator,
-  Modal,
 } from 'react-native';
-import {getFeedbackForAttorney} from '../services/consultationFeedbackService';
+import {MaterialCommunityIcons} from '@expo/vector-icons';
+import {getBundledAttorneyPhotoSource} from '../constants/attorneyPhotos';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
 import {ClientScreenShell, ClientFadeIn} from '../components/ClientScreenShell';
 import ClientChevronBack from '../components/ClientChevronBack';
-
-function StarRow({rating}) {
-  const r = Math.min(5, Math.max(0, Math.round(Number(rating) || 0)));
-  return (
-    <View style={styles.starRow} accessibilityLabel={`${r} out of 5 stars`}>
-      {[1, 2, 3, 4, 5].map(i => (
-        <Text key={i} style={i <= r ? styles.starOn : styles.starOff}>
-          ★
-        </Text>
-      ))}
-    </View>
-  );
-}
 
 function profileInitials(name) {
   const parts = String(name || '')
     .trim()
     .split(/\s+/)
-    .filter(Boolean);
-  if (parts.length === 0) {
-    return '?';
-  }
-  if (parts.length === 1) {
-    return parts[0].slice(0, 2).toUpperCase();
-  }
+    .filter(Boolean)
+    .filter(p => !/^atty\.?$/i.test(p));
+  if (parts.length === 0) return '?';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
-const AttorneyProfile = ({navigation, route}) => {
-  const attorney = route?.params?.attorney || {
-    id: null,
-    name: 'Dr. Sarah Johnson',
-    specialty: 'Corporate Law Expert',
-    prc_id: 'PRC-12345-67890',
-    rating: '4.9',
-    reviews: '128',
-    image: null,
-  };
-
-  const attorneyId = attorney?.id;
-  const [feedbackList, setFeedbackList] = useState([]);
-  const [feedbackLoading, setFeedbackLoading] = useState(true);
-  const [feedbackError, setFeedbackError] = useState(null);
-  const [allModalVisible, setAllModalVisible] = useState(false);
-
-  const loadFeedback = useCallback(async () => {
-    if (!attorneyId) {
-      setFeedbackList([]);
-      setFeedbackLoading(false);
-      return;
-    }
-    setFeedbackLoading(true);
-    setFeedbackError(null);
-    try {
-      const rows = await getFeedbackForAttorney(attorneyId, {limit: 50});
-      setFeedbackList(rows);
-    } catch (e) {
-      setFeedbackError(e?.message || 'Could not load reviews');
-      setFeedbackList([]);
-    } finally {
-      setFeedbackLoading(false);
-    }
-  }, [attorneyId]);
-
-  useEffect(() => {
-    loadFeedback();
-  }, [loadFeedback]);
-
-  const {avgRating, reviewCount} = useMemo(() => {
-    if (!feedbackList.length) {
-      return {
-        avgRating: Number(attorney.rating) || 0,
-        reviewCount: Number(String(attorney.reviews).replace(/\D/g, '')) || 0,
-      };
-    }
-    const sum = feedbackList.reduce((a, x) => a + (Number(x.rating) || 0), 0);
-    return {
-      avgRating: sum / feedbackList.length,
-      reviewCount: feedbackList.length,
-    };
-  }, [feedbackList, attorney.rating, attorney.reviews]);
-
-  const previewFeedback = useMemo(() => feedbackList.slice(0, 10), [feedbackList]);
-
-  const handleBack = () => {
-    if (navigation && navigation.goBack) {
-      navigation.canGoBack() ? navigation.goBack() : null;
-    }
-  };
-
-  const handleBookConsultation = () => {
-    if (navigation && navigation.navigate) {
-      navigation.navigate('BookNow', {
-        attorney: {
-          id: attorney.id,
-          name: attorney.name,
-          specialty: attorney.specialty,
-          price: attorney.price,
-          image: attorney.image,
-        },
-      });
-    }
-  };
-
-  const StatCard = ({label, value}) => (
-    <View style={styles.statCard}>
-      <Text style={styles.statValue}>{value}</Text>
-      <Text style={styles.statLabel}>{label}</Text>
+function ProfilePhoto({name, uri}) {
+  const bundled = getBundledAttorneyPhotoSource(name);
+  if (bundled) {
+    return <Image source={bundled} style={styles.profilePhoto} resizeMode="cover" />;
+  }
+  if (uri) {
+    return <Image source={{uri}} style={styles.profilePhoto} resizeMode="cover" />;
+  }
+  return (
+    <View style={[styles.profilePhoto, styles.profilePhotoPlaceholder]}>
+      <Text style={styles.profilePhotoInitials}>{profileInitials(name)}</Text>
     </View>
   );
+}
 
-  const Badge = ({text}) => (
-    <View style={styles.tagBadge}>
-      <Text style={styles.tagText}>{text}</Text>
-    </View>
-  );
+export default function AttorneyProfile({navigation, route}) {
+  const attorney = route?.params?.attorney || {};
 
-  const renderFeedbackCard = (item, index, fullWidth) => {
-    const name = item.client_display_name?.trim() || 'Verified client';
-    const quote = item.comment?.trim() || 'No written comment.';
-    return (
-      <View
-        key={item.id || String(index)}
-        style={[styles.feedbackCard, fullWidth ? styles.feedbackCardFull : null]}>
-        <StarRow rating={item.rating} />
-        <Text style={styles.feedbackText}>"{quote}"</Text>
-        <View style={styles.clientInfo}>
-          <View style={styles.avatarPlaceholder} />
-          <View style={{flex: 1}}>
-            <Text style={styles.clientName} numberOfLines={1}>
-              {name}
-            </Text>
-            <Text style={styles.clientRole}>Consultation client</Text>
-          </View>
-        </View>
-      </View>
-    );
+  const photoUri = attorney.img || attorney.image || attorney.avatarUri || null;
+  const isVerified = Boolean(attorney.isVerified ?? attorney.verified);
+  const experience = attorney.exp || attorney.experience || '3 years experience';
+  const specialty = attorney.specialty || 'General Practice';
+  const bio =
+    String(attorney.bio || '').trim() || 'No biography available yet.';
+  const details =
+    String(attorney.details || '').trim() ||
+    'No additional profile details provided.';
+  const showDetails = details !== bio;
+  const price = attorney.price || 'PHP 2000.00';
+
+  const handleClose = () => {
+    if (navigation?.canGoBack?.()) {
+      navigation.goBack();
+    }
   };
 
-  const ratingDisplay = avgRating.toFixed(1);
+  const handleBookNow = () => {
+    navigation?.navigate?.('BookNow', {
+      attorney: {
+        ...attorney,
+        img: photoUri,
+        image: photoUri,
+        specialty,
+        price,
+        verified: isVerified,
+        isVerified,
+      },
+    });
+  };
 
   return (
     <ClientScreenShell>
       <ClientFadeIn>
-      <ScrollView showsVerticalScrollIndicator={false}>
-        <View style={styles.headerBackground}>
-          <ClientChevronBack style={styles.backButton} onPress={handleBack} />
+        <View style={styles.topBar}>
+          <ClientChevronBack onPress={handleClose} />
+          <Text style={styles.screenTitle}>Attorney Profile</Text>
+          <TouchableOpacity
+            onPress={handleClose}
+            hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}
+            accessibilityLabel="Close profile">
+            <MaterialCommunityIcons name="close" size={22} color={T.textSoft} />
+          </TouchableOpacity>
+        </View>
 
-          <View style={styles.profileImageContainer}>
-            {attorney.image ? (
-              <Image source={{uri: attorney.image}} style={styles.profileImage} />
-            ) : (
-              <View style={[styles.profileImage, styles.profileImagePlaceholder]}>
-                <Text style={styles.profileImageInitials}>{profileInitials(attorney.name)}</Text>
+        <ScrollView
+          contentContainerStyle={styles.scroll}
+          showsVerticalScrollIndicator={false}>
+          <View style={styles.profileHeader}>
+            <ProfilePhoto name={attorney.name} uri={photoUri} />
+            <View style={styles.profileInfo}>
+              <View style={styles.nameRow}>
+                <Text style={styles.nameText} numberOfLines={3}>
+                  {attorney.name || 'Attorney'}
+                </Text>
+                <MaterialCommunityIcons
+                  name="check-decagram"
+                  size={18}
+                  color={T.gold[0]}
+                  style={styles.verifiedIcon}
+                />
               </View>
-            )}
-          </View>
 
-          <View style={styles.nameContainer}>
-            <Text style={styles.nameText}>
-              {attorney.name}
-              {attorney.isVerified ? ' ✓' : ''}
-            </Text>
-            <Text style={styles.titleText}>{attorney.specialty}</Text>
-            {attorney.prc_id ? <Text style={styles.prcText}>PRC License: {attorney.prc_id}</Text> : null}
-            <Text style={styles.ratingText}>
-              ★ {ratingDisplay} ({reviewCount} {reviewCount === 1 ? 'Review' : 'Reviews'})
-            </Text>
-          </View>
+              <View style={styles.specialtyRow}>
+                <MaterialCommunityIcons name="scale-balance" size={14} color={T.textSoft} />
+                <Text style={styles.specialtyText} numberOfLines={2}>
+                  {specialty}
+                </Text>
+              </View>
 
-          <View style={styles.statsOverlay}>
-            <StatCard value="15+" label="YEARS EXP" />
-            <StatCard value="500+" label="CASES" />
-            <StatCard value="98%" label="SUCCESS" />
-          </View>
-        </View>
-
-        <View style={styles.contentPadding}>
-          <Text style={styles.sectionTitle}>Biography</Text>
-          <Text style={styles.bioText}>
-            {attorney.name} is a distinguished {attorney.specialty} with over 15 years of experience in
-            facilitating complex international mergers and navigating high-stakes regulatory landscapes.
-          </Text>
-
-          <View style={styles.tagContainer}>
-            <Badge text="Mergers & Acquisitions" />
-            <Badge text="Contract Law" />
-            <Badge text="Intellectual Property" />
-          </View>
-
-          <View style={styles.feedbackHeader}>
-            <Text style={styles.sectionTitle}>Recent Client Feedback</Text>
-            {feedbackList.length > 2 ? (
-              <TouchableOpacity onPress={() => setAllModalVisible(true)}>
-                <Text style={styles.viewAll}>VIEW ALL</Text>
-              </TouchableOpacity>
-            ) : (
-              <View style={{width: 56}} />
-            )}
-          </View>
-
-          {feedbackLoading ? (
-            <View style={styles.feedbackLoading}>
-              <ActivityIndicator color={T.gold[1]} />
-              <Text style={styles.feedbackLoadingText}>Loading reviews…</Text>
+              <Text style={styles.expText}>{experience}</Text>
             </View>
-          ) : feedbackError ? (
-            <Text style={styles.feedbackError}>{feedbackError}</Text>
-          ) : previewFeedback.length === 0 ? (
-            <Text style={styles.feedbackEmpty}>No client feedback yet. Reviews appear after consultations end.</Text>
-          ) : (
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.feedbackScroll}>
-              {previewFeedback.map((item, i) => renderFeedbackCard(item, i, false))}
-            </ScrollView>
-          )}
-        </View>
-      </ScrollView>
-
-      <View style={styles.footer}>
-        <TouchableOpacity style={styles.bookButton} onPress={handleBookConsultation} activeOpacity={0.8}>
-          <Text style={styles.bookButtonText}>Book a Consultation</Text>
-        </TouchableOpacity>
-      </View>
-
-      <Modal
-        visible={allModalVisible}
-        animationType="slide"
-        transparent
-        onRequestClose={() => setAllModalVisible(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalSheet}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>All feedback</Text>
-              <TouchableOpacity onPress={() => setAllModalVisible(false)} hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}>
-                <Text style={styles.modalClose}>Close</Text>
-              </TouchableOpacity>
-            </View>
-            <ScrollView style={styles.modalScroll}>
-              {feedbackList.map((item, i) => renderFeedbackCard(item, i, true))}
-            </ScrollView>
           </View>
+
+          <View style={styles.sectionCard}>
+            <Text style={styles.sectionTitle}>Professional Biography</Text>
+            <Text style={styles.bioText}>{bio}</Text>
+            {showDetails ? <Text style={styles.detailsText}>{details}</Text> : null}
+          </View>
+
+          <View style={styles.feeCard}>
+            <View style={styles.feeLabelWrap}>
+              <Text style={styles.feeLabel}>CONSULTATION FEE</Text>
+              <Text style={styles.feeDesc}>Initial Legal Assessment (1 Hour)</Text>
+            </View>
+            <Text style={styles.feeAmount}>{price}</Text>
+          </View>
+        </ScrollView>
+
+        <View style={styles.footer}>
+          <TouchableOpacity style={styles.bookBtn} onPress={handleBookNow} activeOpacity={0.9}>
+            <Text style={styles.bookBtnText}>Book Now</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.closeBtn} onPress={handleClose} activeOpacity={0.9}>
+            <Text style={styles.closeBtnText}>Close</Text>
+          </TouchableOpacity>
         </View>
-      </Modal>
       </ClientFadeIn>
     </ClientScreenShell>
   );
-};
+}
 
 const styles = StyleSheet.create({
-  container: {flex: 1},
-  headerBackground: {
-    backgroundColor: 'rgba(18, 26, 36, 0.95)',
-    paddingTop: 20,
-    paddingBottom: 80,
-    borderBottomLeftRadius: 40,
-    borderBottomRightRadius: 40,
-    alignItems: 'center',
-  },
-  backButton: {position: 'absolute', left: 16, top: 18, zIndex: 10},
-  profileImageContainer: {marginTop: 20},
-  profileImage: {width: 120, height: 120, borderRadius: 60, borderWidth: 4, borderColor: 'rgba(244, 215, 139, 0.35)'},
-  profileImagePlaceholder: {
-    backgroundColor: 'rgba(30, 58, 138, 0.45)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  profileImageInitials: {color: T.gold[0], fontSize: 40, fontWeight: '800'},
-  nameContainer: {alignItems: 'center', marginTop: 15},
-  nameText: {color: 'white', fontSize: 24, fontWeight: 'bold', fontFamily: 'serif'},
-  titleText: {color: '#94A3B8', fontSize: 16, marginTop: 4},
-  prcText: {color: '#CBD5E1', fontSize: 13, marginTop: 4, fontStyle: 'italic'},
-  ratingText: {color: T.gold[0], marginTop: 8, fontWeight: 'bold'},
-  statsOverlay: {
+  topBar: {
     flexDirection: 'row',
-    position: 'absolute',
-    bottom: -40,
-    width: '90%',
-    justifyContent: 'space-between',
-  },
-  statCard: {
-    backgroundColor: 'rgba(18, 26, 36, 0.92)',
-    width: '31%',
-    paddingVertical: 15,
-    borderRadius: 15,
     alignItems: 'center',
-    elevation: 5,
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.15)',
-    shadowColor: '#000',
-    shadowOpacity: 0.2,
-    shadowRadius: 10,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 12,
+    gap: 8,
   },
-  statValue: {fontSize: 20, fontWeight: 'bold', color: T.text},
-  statLabel: {fontSize: 10, color: T.textSoft, marginTop: 4, fontWeight: '800'},
-  contentPadding: {paddingHorizontal: 20, marginTop: 60},
-  sectionTitle: {fontSize: 22, fontWeight: 'bold', color: T.text, fontFamily: 'serif', marginBottom: 12},
-  bioText: {color: T.textMuted, lineHeight: 22, fontSize: 15},
-  tagContainer: {flexDirection: 'row', flexWrap: 'wrap', marginTop: 15},
-  tagBadge: {
-    backgroundColor: 'rgba(244, 215, 139, 0.1)',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 20,
-    marginRight: 8,
-    marginBottom: 8,
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.15)',
-  },
-  tagText: {color: T.textSoft, fontSize: 12, fontWeight: '600'},
-  feedbackHeader: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 25},
-  viewAll: {color: T.gold[0], fontWeight: 'bold', fontSize: 12},
-  feedbackScroll: {marginTop: 15, marginBottom: 100},
-  feedbackCard: {
-    backgroundColor: 'rgba(18, 26, 36, 0.88)',
-    width: 280,
-    padding: 20,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.12)',
-    marginRight: 15,
-  },
-  feedbackCardFull: {
-    width: '100%',
-    marginRight: 0,
-    marginBottom: 16,
-  },
-  starRow: {flexDirection: 'row', marginBottom: 10},
-  starOn: {color: T.gold[1], fontSize: 16},
-  starOff: {color: 'rgba(255,255,255,0.15)', fontSize: 16},
-  feedbackText: {color: T.textMuted, fontStyle: 'italic', lineHeight: 20},
-  clientInfo: {flexDirection: 'row', alignItems: 'center', marginTop: 15},
-  avatarPlaceholder: {width: 40, height: 40, borderRadius: 20, backgroundColor: '#E2E8F0', marginRight: 10},
-  clientName: {fontWeight: 'bold', color: T.text},
-  clientRole: {fontSize: 11, color: T.textSoft},
-  footer: {position: 'absolute', bottom: 0, width: '100%', padding: 20, backgroundColor: 'rgba(4, 7, 11, 0.92)', borderTopWidth: 1, borderTopColor: 'rgba(244, 215, 139, 0.12)'},
-  bookButton: {backgroundColor: T.gold[1], paddingVertical: 18, borderRadius: 15},
-  bookButtonText: {textAlign: 'center', color: T.base, fontWeight: 'bold', fontSize: 18},
-  feedbackLoading: {paddingVertical: 24, alignItems: 'center'},
-  feedbackLoadingText: {marginTop: 8, color: '#64748B', fontSize: 13},
-  feedbackError: {color: '#B91C1C', marginTop: 8, fontSize: 13},
-  feedbackEmpty: {color: '#64748B', fontSize: 14, lineHeight: 20, marginTop: 8, marginBottom: 24},
-  modalBackdrop: {
+  screenTitle: {
     flex: 1,
-    backgroundColor: 'rgba(15, 23, 42, 0.45)',
-    justifyContent: 'flex-end',
+    fontSize: 18,
+    fontWeight: '800',
+    color: T.text,
+    textAlign: 'center',
   },
-  modalSheet: {
-    backgroundColor: 'rgba(18, 26, 36, 0.98)',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    maxHeight: '85%',
-    paddingBottom: 24,
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.12)',
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+  scroll: {
     paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingBottom: 24,
+  },
+  profileHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 16,
+    marginBottom: 20,
+    paddingBottom: 20,
     borderBottomWidth: 1,
     borderBottomColor: 'rgba(244, 215, 139, 0.1)',
   },
-  modalTitle: {fontSize: 18, fontWeight: 'bold', color: T.text, fontFamily: 'serif'},
-  modalClose: {color: T.gold[0], fontWeight: '700', fontSize: 15},
-  modalScroll: {paddingHorizontal: 20, paddingTop: 12},
+  profilePhoto: {
+    width: 96,
+    height: 96,
+    borderRadius: 48,
+    borderWidth: 3,
+    borderColor: 'rgba(244, 215, 139, 0.35)',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+  },
+  profilePhotoPlaceholder: {
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(30, 58, 138, 0.45)',
+  },
+  profilePhotoInitials: {
+    color: T.gold[0],
+    fontSize: 32,
+    fontWeight: '800',
+  },
+  profileInfo: {
+    flex: 1,
+    minWidth: 0,
+    paddingTop: 4,
+  },
+  nameRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 6,
+    marginBottom: 8,
+  },
+  nameText: {
+    flex: 1,
+    fontSize: 18,
+    fontWeight: '800',
+    color: T.text,
+    lineHeight: 24,
+  },
+  verifiedIcon: {marginTop: 2},
+  specialtyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 6,
+  },
+  specialtyText: {
+    flex: 1,
+    fontSize: 13,
+    color: T.textMuted,
+    fontWeight: '500',
+  },
+  expText: {
+    fontSize: 13,
+    color: T.textSoft,
+    marginBottom: 6,
+  },
+  ratingText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: T.gold[0],
+    marginBottom: 4,
+  },
+  sectionCard: {
+    backgroundColor: 'rgba(18, 26, 36, 0.88)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.12)',
+    padding: 18,
+    marginBottom: 14,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: T.text,
+    marginBottom: 12,
+  },
+  bioText: {
+    fontSize: 14,
+    color: T.textMuted,
+    lineHeight: 22,
+  },
+  detailsText: {
+    marginTop: 12,
+    fontSize: 14,
+    color: T.textSoft,
+    lineHeight: 22,
+  },
+  feeCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    backgroundColor: 'rgba(244, 215, 139, 0.08)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.2)',
+    padding: 18,
+  },
+  feeLabelWrap: {flex: 1, minWidth: 0},
+  feeLabel: {
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+    color: T.gold[0],
+    marginBottom: 4,
+  },
+  feeDesc: {
+    fontSize: 13,
+    color: T.textSoft,
+    lineHeight: 18,
+  },
+  feeAmount: {
+    fontSize: 20,
+    fontWeight: '900',
+    color: T.text,
+  },
+  footer: {
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: 20,
+    gap: 10,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(244, 215, 139, 0.12)',
+    backgroundColor: 'rgba(4, 7, 11, 0.92)',
+  },
+  bookBtn: {
+    backgroundColor: T.gold[1],
+    borderRadius: 12,
+    paddingVertical: 15,
+    alignItems: 'center',
+  },
+  bookBtnText: {
+    color: T.base,
+    fontWeight: '800',
+    fontSize: 16,
+  },
+  closeBtn: {
+    borderRadius: 12,
+    paddingVertical: 15,
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderColor: 'rgba(244, 215, 139, 0.35)',
+  },
+  closeBtnText: {
+    color: T.text,
+    fontWeight: '700',
+    fontSize: 16,
+  },
 });
-
-export default AttorneyProfile;

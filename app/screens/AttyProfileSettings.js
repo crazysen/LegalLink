@@ -1,403 +1,680 @@
-import React, {useEffect, useState} from 'react';
+import React, {useCallback, useMemo, useRef, useState} from 'react';
 import {
   ActivityIndicator,
   Alert,
   Image,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
-import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system/legacy';
+import {useFocusEffect} from '@react-navigation/native';
+import {LinearGradient} from 'expo-linear-gradient';
+import {signOutCurrentUser} from '../services/authService';
+import AttorneyScreenHeader from '../components/AttorneyScreenHeader';
 import {ClientScreenShell} from '../components/ClientScreenShell';
 import {useUserProfile} from '../context/UserProfileContext';
-import {getMyProfile, updateMyProfile} from '../services/profileService';
-import {REFERENCE_THEME as T} from '../constants/referenceTheme';
+import {
+  fetchAttorneyProfile,
+  getCachedAttorneyProfile,
+  getCachedProfile,
+  getCurrentSessionProfile,
+  prefetchAttorneyProfileStats,
+  saveAttorneyProfile,
+} from '../services/userApi';
+import {
+  isValidEmail,
+  isValidPhoneNumber,
+  sanitizePhoneInput,
+  VALID_EMAIL_MESSAGE,
+  VALID_PHONE_MESSAGE,
+} from '../utils/validators';
 
-const accentGold = T.gold[1];
+const PROFILE_BLUE = {
+  banner: ['rgba(12, 35, 62, 0.95)', 'rgba(26, 71, 130, 0.75)', 'rgba(50, 97, 168, 0.35)'],
+  avatar: ['#357ad9', '#1d5bc0'],
+  edit: ['#357ad9', '#1d5bc0'],
+  specBg: 'rgba(38, 80, 136, 0.5)',
+  specBorder: 'rgba(159, 193, 232, 0.28)',
+  specText: '#dbe9fb',
+  cardBorder: 'rgba(159, 193, 232, 0.22)',
+  cardBg: 'rgba(8, 19, 33, 0.92)',
+  detailBg: 'rgba(8, 17, 28, 0.72)',
+  label: '#9fb9d8',
+  value: '#eaf3ff',
+  muted: '#c3d7ef',
+};
+
+const emptyProfile = {
+  name: 'Attorney',
+  role: 'Attorney',
+  email: '',
+  phone: '',
+  location: '',
+  ibpNumber: '',
+  avatarUrl: '',
+  specializations: [],
+  bio: '',
+  consultations: 0,
+  notarials: 0,
+  rating: 'N/A',
+};
+
+function initialsFor(name) {
+  return String(name || 'A')
+    .split(' ')
+    .filter(Boolean)
+    .map((p) => p[0])
+    .slice(0, 2)
+    .join('')
+    .toUpperCase();
+}
+
+function seedFromContext(ctx) {
+  if (!ctx?.name && !ctx?.email) return emptyProfile;
+  return {
+    ...emptyProfile,
+    name: ctx.name || 'Attorney',
+    email: ctx.email || '',
+    phone: ctx.phone || '',
+    location: ctx.address || '',
+  };
+}
+
+function mergeProfileFromApi(data, session) {
+  const specs = Array.isArray(data?.specialties)
+    ? data.specialties
+    : Array.isArray(data?.attorney?.specialties)
+      ? data.attorney.specialties
+      : [];
+
+  return {
+    name: data.profile?.full_name || session?.full_name || 'Attorney',
+    role: data.attorney?.firm_name || 'Attorney',
+    email: data.profile?.email || session?.email || '',
+    phone: data.profile?.phone || '',
+    location: data.profile?.address || '',
+    ibpNumber: data.attorney?.prc_id || '',
+    avatarUrl: data.profile?.avatar_url || '',
+    specializations: specs,
+    bio: data.attorney?.bio || '',
+    consultations: data.consultationCount ?? 0,
+    notarials: data.notarialCount ?? 0,
+    rating: 'N/A',
+  };
+}
+
+const DetailCell = React.memo(function DetailCell({label, value}) {
+  return (
+    <View style={styles.detailCell}>
+      <Text style={styles.detailLabel}>{label}</Text>
+      <Text style={styles.detailValue}>{value || '—'}</Text>
+    </View>
+  );
+});
 
 export default function AttyProfileSettings({navigation}) {
-  const {updateProfile} = useUserProfile();
-  const [loading, setLoading] = useState(true);
+  const {width} = useWindowDimensions();
+  const twoColumn = width >= 380;
+  const {profile: ctxProfile, updateProfile} = useUserProfile();
+  const hasHydratedRef = useRef(false);
+
+  const [userId, setUserId] = useState(() => getCachedProfile()?.id || null);
+  const [loading, setLoading] = useState(() => !getCachedAttorneyProfile(getCachedProfile()?.id));
+  const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [errorText, setErrorText] = useState('');
+  const [profile, setProfile] = useState(() => {
+    const id = getCachedProfile()?.id;
+    const cached = id ? getCachedAttorneyProfile(id) : null;
+    if (cached) return mergeProfileFromApi(cached, getCachedProfile());
+    return seedFromContext(ctxProfile);
+  });
+  const [form, setForm] = useState(profile);
 
-  const [fullName, setFullName] = useState('');
-  const [email, setEmail] = useState('');
-  const [phone, setPhone] = useState('');
-  const [address, setAddress] = useState('');
-  const [firmName, setFirmName] = useState('');
-  const [yearsExperience, setYearsExperience] = useState('');
-  const [specialties, setSpecialties] = useState('');
-  const [bio, setBio] = useState('');
-  const [consultationFee, setConsultationFee] = useState('');
+  const applyMerged = useCallback(
+    (merged, session, {preserveForm = false} = {}) => {
+      setProfile(merged);
+      if (!preserveForm) setForm(merged);
+      updateProfile({
+        name: merged.name,
+        email: merged.email,
+        phone: merged.phone,
+        address: merged.location,
+        role: 'Attorney',
+      });
+    },
+    [updateProfile],
+  );
 
-  const [profileImage, setProfileImage] = useState(null);
-  const [currentAvatarUrl, setCurrentAvatarUrl] = useState('');
-  const [credentialDoc, setCredentialDoc] = useState(null);
-  const [existingCredentialUrl, setExistingCredentialUrl] = useState(null);
-
-  useEffect(() => {
-    const loadProfile = async () => {
+  const loadProfile = useCallback(
+    async (options = {}) => {
+      const silent = Boolean(options?.silent);
+      const force = Boolean(options?.force);
+      if (!silent) setLoading(true);
+      setErrorText('');
       try {
-        setLoading(true);
-        const data = await getMyProfile();
-        const attorney = data?.attorney_profile || {};
+        let session = getCachedProfile();
+        if (!session?.id) {
+          const res = await getCurrentSessionProfile();
+          session = res.profile;
+        }
 
-        setFullName(data?.full_name || '');
-        setEmail(data?.email || '');
-        setPhone(data?.phone || '');
-        setAddress(data?.address || '');
-        setFirmName(attorney?.firm_name || '');
-        setYearsExperience(
-          attorney?.years_experience !== null && attorney?.years_experience !== undefined
-            ? String(attorney.years_experience)
-            : '',
-        );
-        setSpecialties(attorney?.specialties || '');
-        setBio(attorney?.bio || '');
-        setConsultationFee(
-          attorney?.consultation_fee !== null && attorney?.consultation_fee !== undefined
-            ? String(attorney.consultation_fee)
-            : '',
-        );
-        setCurrentAvatarUrl(data?.avatar_url || '');
-        setExistingCredentialUrl(data?.credential_document_url || null);
+        const id = session?.id;
+        setUserId(id || null);
+        if (!id) {
+          setProfile(emptyProfile);
+          setForm(emptyProfile);
+          return;
+        }
 
-        updateProfile({
-          name: data?.full_name || '',
-          email: data?.email || '',
-          phone: data?.phone || '',
-          address: data?.address || '',
-          role: 'Attorney',
+        if (!force) {
+          const cached = getCachedAttorneyProfile(id);
+          if (cached) {
+            applyMerged(mergeProfileFromApi(cached, session), session, {
+              preserveForm: options.preserveForm,
+            });
+            if (!silent) setLoading(false);
+            setRefreshing(false);
+            if (!cached.statsLoaded) {
+              prefetchAttorneyProfileStats(id).then((statsPayload) => {
+                if (!statsPayload) return;
+                setProfile((prev) => ({
+                  ...prev,
+                  consultations: statsPayload.consultationCount ?? prev.consultations,
+                  notarials: statsPayload.notarialCount ?? prev.notarials,
+                }));
+              });
+            }
+            return;
+          }
+        }
+
+        const data = await fetchAttorneyProfile(id, {
+          force,
+          includeStats: Boolean(options?.includeStats),
         });
+        applyMerged(mergeProfileFromApi(data, session), session, {
+          preserveForm: options.preserveForm,
+        });
+
+        if (!data.statsLoaded) {
+          prefetchAttorneyProfileStats(id).then((statsPayload) => {
+            if (!statsPayload) return;
+            setProfile((prev) => ({
+              ...prev,
+              consultations: statsPayload.consultationCount ?? prev.consultations,
+              notarials: statsPayload.notarialCount ?? prev.notarials,
+            }));
+          });
+        }
       } catch (error) {
-        Alert.alert('Error', error?.message ?? 'Failed to load attorney profile.');
+        setErrorText(error?.message || 'Failed to load attorney profile.');
       } finally {
-        setLoading(false);
+        if (!silent) setLoading(false);
+        setRefreshing(false);
       }
-    };
+    },
+    [applyMerged],
+  );
 
-    loadProfile();
-  }, [updateProfile]);
+  useFocusEffect(
+    useCallback(() => {
+      const silent = hasHydratedRef.current;
+      hasHydratedRef.current = true;
+      loadProfile({silent, preserveForm: editing});
+    }, [editing, loadProfile]),
+  );
 
-  const pickProfileImage = async () => {
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: ['image/*'],
-        copyToCacheDirectory: true,
-      });
-      if (!result.canceled) {
-        setProfileImage(result.assets?.[0] ?? null);
-      }
-    } catch (error) {
-      Alert.alert('Error', error?.message ?? 'Unable to pick image.');
-    }
-  };
-
-  const pickCredentialDocument = async () => {
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: ['application/pdf', 'image/*'],
-        copyToCacheDirectory: true,
-      });
-      if (!result.canceled) {
-        setCredentialDoc(result.assets?.[0] ?? null);
-      }
-    } catch (error) {
-      Alert.alert('Error', error?.message ?? 'Unable to pick credential document.');
-    }
-  };
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    loadProfile({silent: true, force: true, includeStats: true, preserveForm: editing});
+  }, [editing, loadProfile]);
 
   const handleSave = async () => {
-    if (!fullName.trim()) {
-      Alert.alert('Error', 'Full name is required.');
+    if (!userId) return;
+    if (!form.name.trim()) {
+      setErrorText('Full name is required.');
+      return;
+    }
+    if (!isValidEmail(form.email)) {
+      setErrorText(VALID_EMAIL_MESSAGE);
+      return;
+    }
+    if (!isValidPhoneNumber(form.phone)) {
+      setErrorText(VALID_PHONE_MESSAGE);
       return;
     }
 
     try {
       setSaving(true);
-
-      let avatarBase64 = null;
-      if (profileImage?.uri) {
-        avatarBase64 = await FileSystem.readAsStringAsync(profileImage.uri, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
-      }
-
-      let credentialBase64 = null;
-      if (credentialDoc?.uri) {
-        credentialBase64 = await FileSystem.readAsStringAsync(credentialDoc.uri, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
-      }
-
-      const updated = await updateMyProfile({
-        full_name: fullName.trim(),
-        phone: phone.trim() || null,
-        address: address.trim() || null,
-        role: 'attorney',
-        firm_name: firmName.trim() || null,
-        years_experience: yearsExperience ? Number(yearsExperience) : null,
-        specialties: specialties.trim() || null,
-        bio: bio.trim() || null,
-        consultation_fee: consultationFee ? Number(consultationFee) : null,
-        avatar_base64: avatarBase64,
-        avatar_name: profileImage?.name || null,
-        credential_document_base64: credentialBase64,
-        credential_document_name: credentialDoc?.name || null,
-      });
-
-      setCurrentAvatarUrl(updated?.avatar_url || currentAvatarUrl);
-      setExistingCredentialUrl(updated?.credential_document_url || existingCredentialUrl);
-
+      setErrorText('');
+      const payload = {
+        fullName: form.name.trim(),
+        role: form.role.trim(),
+        email: form.email.trim(),
+        phone: form.phone.trim(),
+        location: form.location.trim(),
+        ibpNumber: form.ibpNumber.trim(),
+        bio: form.bio.trim(),
+        specializations: profile.specializations,
+      };
+      await saveAttorneyProfile(userId, payload);
+      const next = {...form, phone: payload.phone};
+      setProfile(next);
+      setForm(next);
+      setEditing(false);
       updateProfile({
-        name: updated?.full_name || fullName.trim(),
-        email: updated?.email || email.trim(),
-        phone: updated?.phone || phone.trim(),
-        address: updated?.address || address.trim(),
+        name: next.name,
+        email: next.email,
+        phone: next.phone,
+        address: next.location,
         role: 'Attorney',
       });
-
-      Alert.alert('Saved', 'Attorney profile updated successfully.');
+      Alert.alert('Saved', 'Profile updated successfully.');
     } catch (error) {
-      Alert.alert('Error', error?.message ?? 'Unable to save attorney profile.');
+      setErrorText(error?.message || 'Failed to save attorney profile.');
     } finally {
       setSaving(false);
     }
   };
 
+  const handleSignOut = async () => {
+    try {
+      await signOutCurrentUser();
+    } catch {
+      // session may already be cleared
+    }
+    navigation.reset({index: 0, routes: [{name: 'Landing'}]});
+  };
+
+  const specTags = useMemo(
+    () => (profile.specializations?.length ? profile.specializations : []),
+    [profile.specializations],
+  );
+
+  const detailItems = useMemo(
+    () => [
+      {label: 'Email Address', value: profile.email},
+      {label: 'Phone Number', value: profile.phone},
+      {label: 'Office Location', value: profile.location},
+      {label: 'IBP/PRC ID', value: profile.ibpNumber},
+    ],
+    [profile],
+  );
+
   return (
     <ClientScreenShell edges={['top']}>
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.canGoBack() ? navigation.goBack() : null}>
-          <Text style={styles.backText}>← Back</Text>
-        </TouchableOpacity>
-        <Text style={styles.title}>Attorney Profile Settings</Text>
-      </View>
+      <AttorneyScreenHeader
+        navigation={navigation}
+        title="Attorney Dashboard"
+        subtitle="Attorney Workspace"
+        activeRoute="AttyProfileSettings"
+      />
 
-      <ScrollView contentContainerStyle={styles.content}>
-        {loading ? (
+      <ScrollView
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#5e99f3" />
+        }>
+        {errorText ? (
+          <View style={styles.errorBanner}>
+            <Text style={styles.errorText}>{errorText}</Text>
+          </View>
+        ) : null}
+
+        {loading && !profile.name && !refreshing ? (
           <View style={styles.loadingCard}>
-            <ActivityIndicator color={accentGold} />
+            <ActivityIndicator color="#5e99f3" />
             <Text style={styles.loadingText}>Loading profile...</Text>
           </View>
         ) : null}
 
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Identity</Text>
+        <View style={[styles.profileCard, loading && styles.profileCardLoading]}>
+          <LinearGradient colors={PROFILE_BLUE.banner} start={{x: 0, y: 0}} end={{x: 1, y: 1}} style={styles.banner} />
 
-          <Text style={styles.label}>Full Name</Text>
-          <TextInput style={styles.input} value={fullName} onChangeText={setFullName} />
+          <View style={styles.profileBody}>
+            <View style={styles.profileTopRow}>
+              {profile.avatarUrl ? (
+                <Image source={{uri: profile.avatarUrl}} style={styles.avatarImage} />
+              ) : (
+                <LinearGradient colors={PROFILE_BLUE.avatar} style={styles.avatar}>
+                  <Text style={styles.avatarText}>{initialsFor(profile.name)}</Text>
+                </LinearGradient>
+              )}
 
-          <Text style={styles.label}>Email</Text>
-          <TextInput
-            style={[styles.input, styles.disabledInput]}
-            value={email}
-            editable={false}
-            autoCapitalize="none"
-            keyboardType="email-address"
-          />
-
-          <Text style={styles.label}>Phone</Text>
-          <TextInput style={styles.input} value={phone} onChangeText={setPhone} />
-
-          <Text style={styles.label}>Office Address</Text>
-          <TextInput
-            style={[styles.input, styles.multiline]}
-            value={address}
-            onChangeText={setAddress}
-            multiline
-          />
-
-          <View style={styles.avatarPreviewBox}>
-            {profileImage?.uri || currentAvatarUrl ? (
-              <Image
-                source={{uri: profileImage?.uri || currentAvatarUrl}}
-                style={styles.avatarPreview}
-              />
-            ) : (
-              <View style={styles.avatarPlaceholder}>
-                <Text style={styles.avatarPlaceholderText}>No image</Text>
+              <View style={styles.profileInfo}>
+                <Text style={styles.profileName} numberOfLines={2}>
+                  {profile.name}
+                </Text>
+                <Text style={styles.profileRole}>{profile.role}</Text>
+                {specTags.length > 0 ? (
+                  <View style={styles.specRow}>
+                    {specTags.map((s) => (
+                      <View key={s} style={styles.specTag}>
+                        <Text style={styles.specTagText}>{s}</Text>
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
               </View>
-            )}
-            <Text style={styles.hintText}>
-              {profileImage?.name
-                ? `Selected: ${profileImage.name}`
-                : currentAvatarUrl
-                  ? 'Current profile image'
-                  : 'Upload an attorney profile image'}
-            </Text>
+            </View>
+
+            {!editing ? (
+              <View style={styles.profileActions}>
+                <TouchableOpacity activeOpacity={0.88} onPress={() => setEditing(true)}>
+                  <LinearGradient colors={PROFILE_BLUE.edit} style={styles.editBtn}>
+                    <Text style={styles.editBtnText}>Edit Profile</Text>
+                  </LinearGradient>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.signOutBtn} activeOpacity={0.88} onPress={handleSignOut}>
+                  <Text style={styles.signOutBtnText}>Sign Out</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
           </View>
-
-          <TouchableOpacity style={styles.uploadButton} onPress={pickProfileImage}>
-            <Text style={styles.uploadButtonText}>
-              {profileImage?.name ? `Image: ${profileImage.name}` : 'Upload Profile Image'}
-            </Text>
-          </TouchableOpacity>
         </View>
 
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Professional Details</Text>
-
-          <Text style={styles.label}>Law Firm</Text>
-          <TextInput style={styles.input} value={firmName} onChangeText={setFirmName} />
-
-          <Text style={styles.label}>Years of Experience</Text>
-          <TextInput
-            style={styles.input}
-            value={yearsExperience}
-            onChangeText={setYearsExperience}
-            keyboardType="numeric"
-          />
-
-          <Text style={styles.label}>Specialties</Text>
-          <TextInput
-            style={styles.input}
-            value={specialties}
-            onChangeText={setSpecialties}
-            placeholder="Civil Law, Family Law"
-          />
-
-          <Text style={styles.label}>Consultation Fee</Text>
-          <TextInput
-            style={styles.input}
-            value={consultationFee}
-            onChangeText={setConsultationFee}
-            keyboardType="decimal-pad"
-            placeholder="2500"
-          />
-
-          <Text style={styles.label}>Bio</Text>
-          <TextInput
-            style={[styles.input, styles.multiline]}
-            value={bio}
-            onChangeText={setBio}
-            multiline
-          />
-
-          <TouchableOpacity style={styles.uploadButton} onPress={pickCredentialDocument}>
-            <Text style={styles.uploadButtonText}>
-              {credentialDoc?.name
-                ? `Credential: ${credentialDoc.name}`
-                : existingCredentialUrl
-                  ? 'Replace Credential Document'
-                  : 'Upload Credential Document'}
-            </Text>
-          </TouchableOpacity>
-
-          {existingCredentialUrl ? (
-            <Text style={styles.hintText}>Saved credential: {existingCredentialUrl}</Text>
-          ) : null}
+        <View style={styles.statsRow}>
+          <StatBox value={String(profile.consultations)} label="Consultations" />
+          <StatBox value={String(profile.notarials)} label="Notarials" />
+          <StatBox value={profile.rating} label="Rating" />
         </View>
 
-        <TouchableOpacity
-          style={[styles.saveButton, (saving || loading) && styles.disabledButton]}
-          onPress={handleSave}
-          disabled={saving || loading}>
-          <Text style={styles.saveButtonText}>{saving ? 'Saving...' : 'Save Changes'}</Text>
-        </TouchableOpacity>
+        <View style={styles.detailsCard}>
+          {!editing ? (
+            <>
+              <Text style={styles.sectionTitle}>Attorney Information</Text>
+              <View style={[styles.detailGrid, twoColumn && styles.detailGridTwoCol]}>
+                {detailItems.map((item) => (
+                  <DetailCell key={item.label} label={item.label} value={item.value} />
+                ))}
+              </View>
+
+              <Text style={[styles.sectionTitle, styles.sectionTitleSpaced]}>Professional Bio</Text>
+              <View style={styles.bioBox}>
+                <Text style={styles.bioText}>{profile.bio || 'No bio available.'}</Text>
+              </View>
+            </>
+          ) : (
+            <>
+              <Text style={styles.sectionTitle}>Edit Profile</Text>
+              <View style={[styles.formGrid, twoColumn && styles.detailGridTwoCol]}>
+                <FormField label="Full Name" value={form.name} onChangeText={(v) => setForm({...form, name: v})} />
+                <FormField
+                  label="Firm / Title"
+                  value={form.role}
+                  onChangeText={(v) => setForm({...form, role: v})}
+                />
+                <FormField
+                  label="Email"
+                  value={form.email}
+                  onChangeText={(v) => setForm({...form, email: v})}
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                />
+                <FormField
+                  label="Phone"
+                  value={form.phone}
+                  onChangeText={(v) => setForm({...form, phone: sanitizePhoneInput(v)})}
+                  keyboardType="phone-pad"
+                />
+                <FormField
+                  label="Location"
+                  value={form.location}
+                  onChangeText={(v) => setForm({...form, location: v})}
+                />
+                <FormField
+                  label="IBP Number"
+                  value={form.ibpNumber}
+                  onChangeText={(v) => setForm({...form, ibpNumber: v})}
+                />
+              </View>
+              <Text style={styles.fieldLabel}>Bio</Text>
+              <TextInput
+                style={[styles.input, styles.multiline]}
+                value={form.bio}
+                onChangeText={(v) => setForm({...form, bio: v})}
+                multiline
+                placeholder="Professional background..."
+                placeholderTextColor={PROFILE_BLUE.label}
+              />
+              <View style={styles.formActions}>
+                <TouchableOpacity
+                  style={styles.cancelBtn}
+                  onPress={() => {
+                    setForm(profile);
+                    setEditing(false);
+                    setErrorText('');
+                  }}>
+                  <Text style={styles.cancelBtnText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.saveBtnWrap, saving && styles.disabledBtn]}
+                  disabled={saving}
+                  onPress={handleSave}>
+                  <LinearGradient colors={PROFILE_BLUE.edit} style={styles.saveBtn}>
+                    <Text style={styles.editBtnText}>{saving ? 'Saving...' : 'Save Changes'}</Text>
+                  </LinearGradient>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+        </View>
       </ScrollView>
     </ClientScreenShell>
   );
 }
 
+function StatBox({value, label}) {
+  return (
+    <View style={styles.statCard}>
+      <Text style={styles.statValue}>{value}</Text>
+      <Text style={styles.statLabel}>{label}</Text>
+    </View>
+  );
+}
+
+function FormField({label, value, onChangeText, keyboardType, autoCapitalize}) {
+  return (
+    <View style={styles.formField}>
+      <Text style={styles.fieldLabel}>{label}</Text>
+      <TextInput
+        style={styles.input}
+        value={value}
+        onChangeText={onChangeText}
+        keyboardType={keyboardType}
+        autoCapitalize={autoCapitalize || 'sentences'}
+        placeholderTextColor={PROFILE_BLUE.label}
+      />
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
-  header: {
-    paddingHorizontal: 20,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(244, 215, 139, 0.1)',
-  },
-  backText: {color: accentGold, fontWeight: '800', fontSize: 16, marginBottom: 6},
-  title: {fontSize: 24, fontWeight: '900', color: T.text},
-  content: {padding: 20, paddingBottom: 32},
+  content: {padding: 16, paddingBottom: 40},
   loadingCard: {
-    backgroundColor: 'rgba(12, 19, 30, 0.85)',
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.12)',
-    borderRadius: 12,
-    padding: 12,
     flexDirection: 'row',
     alignItems: 'center',
     marginBottom: 12,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: PROFILE_BLUE.cardBg,
+    borderWidth: 1,
+    borderColor: PROFILE_BLUE.cardBorder,
   },
-  loadingText: {fontSize: 13, color: T.textMuted, marginLeft: 8},
-  card: {
-    backgroundColor: 'rgba(12, 19, 30, 0.92)',
-    borderRadius: 16,
-    padding: 16,
+  loadingText: {color: PROFILE_BLUE.muted, marginLeft: 8},
+  errorBanner: {
+    marginBottom: 12,
+    padding: 12,
+    borderRadius: 10,
+    backgroundColor: 'rgba(164, 36, 36, 0.34)',
+    borderWidth: 1,
+    borderColor: 'rgba(241, 131, 131, 0.45)',
+  },
+  errorText: {color: '#ffd3d3', fontWeight: '600', fontSize: 13},
+  profileCard: {
+    borderRadius: 20,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: PROFILE_BLUE.cardBorder,
+    backgroundColor: PROFILE_BLUE.cardBg,
     marginBottom: 14,
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.12)',
   },
-  sectionTitle: {fontSize: 18, fontWeight: '800', color: T.text, marginBottom: 10},
-  label: {fontSize: 13, fontWeight: '600', color: T.textMuted, marginBottom: 6, marginTop: 10},
-  input: {
-    backgroundColor: 'rgba(4, 7, 11, 0.45)',
+  profileCardLoading: {opacity: 0.92},
+  banner: {height: 88},
+  profileBody: {marginTop: -36, paddingHorizontal: 16, paddingBottom: 16},
+  profileTopRow: {flexDirection: 'row', alignItems: 'flex-end', gap: 14},
+  avatar: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 4,
+    borderColor: 'rgba(10, 24, 40, 0.95)',
+  },
+  avatarImage: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    borderWidth: 4,
+    borderColor: 'rgba(10, 24, 40, 0.95)',
+  },
+  avatarText: {color: '#fff', fontSize: 26, fontWeight: '800'},
+  profileInfo: {flex: 1, minWidth: 0, paddingBottom: 4},
+  profileName: {fontSize: 22, fontWeight: '800', color: '#f6f9ff', lineHeight: 26},
+  profileRole: {fontSize: 14, fontWeight: '600', color: PROFILE_BLUE.muted, marginTop: 4},
+  specRow: {flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10},
+  specTag: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: PROFILE_BLUE.specBg,
     borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.15)',
+    borderColor: PROFILE_BLUE.specBorder,
+  },
+  specTagText: {color: PROFILE_BLUE.specText, fontSize: 11, fontWeight: '700'},
+  profileActions: {flexDirection: 'row', marginTop: 16, gap: 10},
+  editBtn: {
+    paddingVertical: 11,
+    paddingHorizontal: 18,
+    borderRadius: 11,
+    minWidth: 120,
+    alignItems: 'center',
+  },
+  editBtnText: {color: '#f5f9ff', fontWeight: '700', fontSize: 13},
+  signOutBtn: {
+    paddingVertical: 11,
+    paddingHorizontal: 16,
+    borderRadius: 11,
+    backgroundColor: 'rgba(121, 22, 22, 0.82)',
+    borderWidth: 1,
+    borderColor: 'rgba(240, 141, 141, 0.36)',
+    justifyContent: 'center',
+  },
+  signOutBtnText: {color: '#ffd3d3', fontWeight: '700', fontSize: 13},
+  statsRow: {flexDirection: 'row', gap: 10, marginBottom: 14},
+  statCard: {
+    flex: 1,
+    paddingVertical: 16,
+    paddingHorizontal: 8,
+    borderRadius: 14,
+    alignItems: 'center',
+    backgroundColor: PROFILE_BLUE.cardBg,
+    borderWidth: 1,
+    borderColor: PROFILE_BLUE.cardBorder,
+  },
+  statValue: {fontSize: 28, fontWeight: '800', color: '#f5f9ff'},
+  statLabel: {
+    marginTop: 8,
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    color: '#bcd1ea',
+  },
+  detailsCard: {
+    padding: 18,
+    borderRadius: 16,
+    backgroundColor: PROFILE_BLUE.cardBg,
+    borderWidth: 1,
+    borderColor: PROFILE_BLUE.cardBorder,
+  },
+  sectionTitle: {fontSize: 18, fontWeight: '800', color: '#f5f9ff', marginBottom: 12},
+  sectionTitleSpaced: {marginTop: 8},
+  detailGrid: {gap: 10},
+  detailGridTwoCol: {flexDirection: 'row', flexWrap: 'wrap'},
+  detailCell: {
+    flexGrow: 1,
+    flexBasis: '48%',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(159, 193, 232, 0.14)',
+    backgroundColor: PROFILE_BLUE.detailBg,
+    padding: 12,
+    marginBottom: 4,
+  },
+  detailLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+    color: PROFILE_BLUE.label,
+  },
+  detailValue: {
+    marginTop: 4,
+    fontSize: 14,
+    fontWeight: '600',
+    color: PROFILE_BLUE.value,
+  },
+  bioBox: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(159, 193, 232, 0.14)',
+    backgroundColor: PROFILE_BLUE.detailBg,
+    padding: 14,
+  },
+  bioText: {color: '#c8dbf1', fontSize: 14, lineHeight: 22},
+  formGrid: {gap: 4},
+  formField: {marginBottom: 4, flexGrow: 1, flexBasis: '48%'},
+  fieldLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+    color: PROFILE_BLUE.label,
+    marginBottom: 6,
+    marginTop: 8,
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: 'rgba(147, 186, 231, 0.32)',
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    color: T.text,
+    color: PROFILE_BLUE.value,
+    backgroundColor: 'rgba(8, 17, 28, 0.88)',
+    fontSize: 14,
   },
-  disabledInput: {
-    backgroundColor: 'rgba(18, 26, 36, 0.6)',
-    color: T.textSoft,
-  },
-  multiline: {minHeight: 84, textAlignVertical: 'top'},
-  uploadButton: {
-    marginTop: 14,
+  multiline: {minHeight: 110, textAlignVertical: 'top'},
+  formActions: {flexDirection: 'row', justifyContent: 'flex-end', marginTop: 14, gap: 8},
+  cancelBtn: {
+    paddingVertical: 11,
+    paddingHorizontal: 16,
+    borderRadius: 11,
+    backgroundColor: 'rgba(121, 22, 22, 0.82)',
     borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.25)',
-    borderStyle: 'dashed',
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 10,
-    alignItems: 'center',
-    backgroundColor: 'rgba(4, 7, 11, 0.35)',
+    borderColor: 'rgba(240, 141, 141, 0.36)',
   },
-  uploadButtonText: {fontWeight: '800', color: accentGold, fontSize: 13},
-  hintText: {fontSize: 12, color: T.textMuted, marginTop: 8},
-  avatarPreviewBox: {
-    marginTop: 12,
-    alignItems: 'center',
-    paddingVertical: 10,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(244, 215, 139, 0.12)',
-    backgroundColor: 'rgba(4, 7, 11, 0.35)',
-  },
-  avatarPreview: {
-    width: 92,
-    height: 92,
-    borderRadius: 46,
-    borderWidth: 2,
-    borderColor: 'rgba(244, 215, 139, 0.3)',
-  },
-  avatarPlaceholder: {
-    width: 92,
-    height: 92,
-    borderRadius: 46,
-    backgroundColor: 'rgba(18, 26, 36, 0.8)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  avatarPlaceholderText: {
-    color: T.textSoft,
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  saveButton: {
-    height: 48,
-    borderRadius: 12,
-    backgroundColor: accentGold,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  disabledButton: {opacity: 0.7},
-  saveButtonText: {color: '#101B2C', fontWeight: '800', fontSize: 16},
+  cancelBtnText: {color: '#ffd3d3', fontWeight: '700'},
+  saveBtnWrap: {borderRadius: 11, overflow: 'hidden'},
+  saveBtn: {paddingVertical: 11, paddingHorizontal: 18, alignItems: 'center'},
+  disabledBtn: {opacity: 0.65},
 });

@@ -97,12 +97,14 @@ export async function getThreadMessages(threadId) {
       return {
         messages,
         isClosed: Boolean(result.isClosed),
+        roomId: result.roomId || null,
+        videoMeetingId: result.videoMeetingId || null,
       };
     }
-    return {messages: [], isClosed: false};
+    return {messages: [], isClosed: false, roomId: null, videoMeetingId: null};
   } catch (_) {
     const local = await getLocalThreadMessages(threadId);
-    return {messages: local, isClosed: false};
+    return {messages: local, isClosed: false, roomId: null, videoMeetingId: null};
   }
 }
 
@@ -141,13 +143,31 @@ export async function appendThreadAttachment(threadId, asset) {
  * @param {React.Dispatch<React.SetStateAction<boolean>>} [setIsClosed]
  * @returns {Promise<() => void>}
  */
-export async function attachThreadRealtime(threadId, setMessages, setIsClosed) {
+export async function attachThreadRealtime(
+  threadId,
+  setMessages,
+  setIsClosed,
+  options = {},
+) {
+  const onVideoMeetingChange =
+    typeof options?.onVideoMeetingChange === 'function'
+      ? options.onVideoMeetingChange
+      : null;
+  const onMessageDelete =
+    typeof options?.onMessageDelete === 'function' ? options.onMessageDelete : null;
+
   const unsub = await subscribeToConsultationRoom(threadId, {
     onMessageInsert: mapped => {
       const ui = mapApiMessage(mapped);
       setMessages(prev => mergeById(prev, ui));
     },
-    onRoomUpdate: ({is_closed}) => {
+    onMessageDelete: payload => {
+      const messageId = String(payload?.id || '');
+      if (!messageId) return;
+      setMessages(prev => prev.filter(m => String(m.id) !== messageId));
+      onMessageDelete?.(messageId);
+    },
+    onRoomUpdate: ({is_closed, video_meeting_id}) => {
       const closed = Boolean(is_closed);
       if (setIsClosed) {
         setIsClosed(closed);
@@ -155,6 +175,9 @@ export async function attachThreadRealtime(threadId, setMessages, setIsClosed) {
       setMessages(prev =>
         prev.map(m => ({...m, is_closed: closed})),
       );
+      if (onVideoMeetingChange) {
+        onVideoMeetingChange(video_meeting_id ?? null);
+      }
     },
   });
   return unsub;

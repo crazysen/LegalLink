@@ -2,11 +2,17 @@ import React, {useCallback, useEffect} from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  Image,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import {
+  isAdminAnnouncementNotification,
+  openAnnouncementDetail,
+  parseNotificationImageUrl,
+} from '../services/announcementImages';
 import {useFocusEffect} from '@react-navigation/native';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
 import {ClientScreenShell, ClientFadeIn} from '../components/ClientScreenShell';
@@ -33,7 +39,8 @@ function getIconForType(type) {
   const t = String(type || '').toLowerCase();
   if (t === 'payment')         return {icon: '💳', bg: '#EEF2FF'};
   if (t === 'notarial_update') return {icon: '📄', bg: '#F0FDF4'};
-  if (t === 'consultation')    return {icon: '📅', bg: '#FEF3C7'};
+  if (t === 'consultation')    return {icon: '📋', bg: '#FEF3C7'};
+  if (t === 'reschedule')      return {icon: '🔄', bg: '#E0F2FE'};
   if (t === 'announcement' || t === 'admin_announcement') return {icon: '📢', bg: '#FFF7ED'};
   return {icon: '🔔', bg: '#E2E8F0'};
 }
@@ -65,7 +72,47 @@ export default function ClientNotification({navigation}) {
     // Mark individual notification read immediately
     if (!item.is_read) markRead(item.id);
 
-    // Deep-link from data field if present
+    const type = String(item.type || '').toLowerCase();
+    if (type === 'notarial_update') {
+      navigation.navigate('ClientNotaryStatus');
+      return;
+    }
+
+    const appointmentId =
+      item.appointmentId ||
+      item.data?.appointment_id ||
+      item.data?.appointmentId ||
+      null;
+
+    if (type === 'consultation_time_warning' && appointmentId) {
+      navigation.navigate('EnterConsultationChat', {
+        chatId: String(appointmentId),
+        chatName: item.title || 'Attorney',
+        initials: 'AT',
+      });
+      return;
+    }
+
+    if (
+      (type === 'consultation' || type === 'consultation_summary') &&
+      appointmentId
+    ) {
+      navigation.navigate('ClientConsultationLogs', {
+        appointmentId: String(appointmentId),
+      });
+      return;
+    }
+
+    if (isAdminAnnouncementNotification(type)) {
+      openAnnouncementDetail(navigation, item);
+      return;
+    }
+
+    if (type === 'reschedule') {
+      navigation.navigate('MyAppointments');
+      return;
+    }
+
     const data = item.data || {};
     if (data.screen) {
       navigation.navigate(data.screen, data.params || {});
@@ -111,6 +158,8 @@ export default function ClientNotification({navigation}) {
           renderItem={({item, index}) => {
             const {icon, bg} = getIconForType(item.type);
             const isUnread = !item.is_read;
+            const imageUrl =
+              item.imageUrl || parseNotificationImageUrl(item.data);
             return (
               <ClientFadeIn delay={40 + index * 35}>
                 <TouchableOpacity
@@ -136,6 +185,13 @@ export default function ClientNotification({navigation}) {
                     <Text style={styles.descriptionText} numberOfLines={3}>
                       {item.body}
                     </Text>
+                    {imageUrl ? (
+                      <Image
+                        source={{uri: imageUrl}}
+                        style={styles.announcementImage}
+                        resizeMode="cover"
+                      />
+                    ) : null}
                   </View>
                 </TouchableOpacity>
               </ClientFadeIn>
@@ -258,5 +314,12 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: T.textMuted,
     lineHeight: 19,
+  },
+  announcementImage: {
+    width: '100%',
+    height: 140,
+    borderRadius: 12,
+    marginTop: 10,
+    backgroundColor: 'rgba(255,255,255,0.06)',
   },
 });

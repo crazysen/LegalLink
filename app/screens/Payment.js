@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Alert,
   ActivityIndicator,
@@ -15,38 +15,60 @@ import ClientChevronBack from '../components/ClientChevronBack';
 import {
   getCurrentSessionProfile,
   createAppointmentBooking,
+  createNotarialRequest,
+  markNotarialRequestPaid,
   notifyAttorneyOfPaidBooking,
   abandonAppointmentCheckout,
   cancelPendingUnpaidBooking,
   payForAppointment,
   getAppointmentPaymentStatus,
-  payForNotarialSession,
-  getNotarialPaymentStatus,
-  payForNotarialRequest,
   fetchAppointmentPaymentDetails,
   fetchNotarialPaymentDetails,
 } from '../services/userApi';
-
-const PAYMONGO_METHOD_TYPES = ['gcash', 'paymaya', 'qrph'];
+import {
+  payForNotarialCheckout,
+  finalizeNotarialAfterPaidCheckout,
+} from '../services/notarialPaymentCheckout';
+import { warmPaymentBackend } from '../services/paymentApiClient';
+import {
+  DEFAULT_PAYMENT_METHOD,
+  PAYMONGO_PAYMENT_METHOD_TYPES,
+} from '../constants/paymentConfig';
+const PAYMENT_POLL_INITIAL_MS = 800;
+const PAYMENT_POLL_MAX_MS = 5000;
+const PAYMENT_POLL_BACKOFF_MS = 400;
 
 function toPayApiMethod(m) {
   const v = String(m || '').trim().toLowerCase();
-  if (v === 'maya' || v === 'paymaya') return 'paymaya';
-  if (v === 'qrph' || v === 'qr ph' || v === 'qr_ph') return 'qrph';
-  return 'gcash';
+  if (v === 'qrph' || v === 'qr ph' || v === 'qr_ph') {
+    return DEFAULT_PAYMENT_METHOD;
+  }
+  return DEFAULT_PAYMENT_METHOD;
 }
 
 export default function Payment({navigation, route}) {
   const [pin, setPin] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const paymentMethod = route?.params?.paymentMethod || 'gcash';
+  const paymentMethod = route?.params?.paymentMethod || DEFAULT_PAYMENT_METHOD;
   const serviceData = route?.params?.serviceData || { amount: '₱2,500' };
   const paymentContext = route?.params?.paymentContext || null;
-  // Notarial requests now go through Paymongo checkout (same as appointments)
+  // PayMongo via /payments/appointments/* (Book Appointment + notarial on hosted API).
   const isPaymongoFlow =
     paymentContext?.sourceType === 'appointment' ||
     paymentContext?.sourceType === 'appointment_booking' ||
     paymentContext?.sourceType === 'notarial';
+  const isWebStyleConsultationPay =
+    paymentContext?.sourceType === 'appointment' ||
+    paymentContext?.sourceType === 'appointment_booking';
+  const canPrefetchCheckoutSession =
+    Boolean(paymentContext?.sourceId) &&
+    (paymentContext?.sourceType === 'appointment' ||
+      paymentContext?.sourceType === 'notarial');
+  const notarialRequestIdRef = useRef(
+    paymentContext?.sourceType === 'notarial' ? paymentContext.sourceId : null,
+  );
+  // Holds notarial request ID created as part of a bundled booking+notarial payment
+  const notarialCreatedIdRef = useRef(null);
   const paymentOnceRef = useRef(false);
   const appointmentIdRef = useRef(
     paymentContext?.sourceType === 'appointment' ? paymentContext.sourceId : null,
@@ -56,40 +78,17 @@ export default function Payment({navigation, route}) {
   const transactionIdRef = useRef(null);
   const clientIdRef = useRef(null);
   const [checkoutSession, setCheckoutSession] = useState(null);
-  const [isOpening, setIsOpening] = useState(false);
-  const [isPolling, setIsPolling] = useState(false);
+  const [isPaying, setIsPaying] = useState(false);
+  const [sessionPreparing, setSessionPreparing] = useState(false);
   const [paymentStatus, setPaymentStatus] = useState('idle');
+  const cancelPaymentRef = useRef(false);
+  const prefetchStartedRef = useRef(false);
 
-  const getPaymentMethodLabel = () => {
-    const methods = {
-      gcash: 'GCash',
-      maya: 'Maya',
-      paymaya: 'Maya',
-      qrph: 'QR Ph',
-      paypal: 'PayPal',
-      card: 'Credit/Debit Card',
-      banktransfer: 'Bank Transfer',
-    };
-    return methods[String(paymentMethod).toLowerCase()] || 'Payment';
-  };
+  const getPaymentMethodLabel = () => 'QR Ph';
 
-  const getMethodIcon = () => {
-    const normalizedMethod = String(paymentMethod).toLowerCase();
-    if (normalizedMethod === 'gcash') return '📱';
-    if (normalizedMethod === 'maya' || normalizedMethod === 'paymaya') return '💜';
-    if (normalizedMethod === 'qrph') return '🔳';
-    if (normalizedMethod === 'paypal') return '🏦';
-    if (normalizedMethod === 'card') return '💳';
-    return '🏧';
-  };
+  const getMethodIcon = () => '🔳';
 
-  const getMethodLogo = () => {
-    const normalizedMethod = String(paymentMethod).toLowerCase();
-    if (normalizedMethod === 'gcash') return require('../assets/images/Gcash_logo.png');
-    if (normalizedMethod === 'maya' || normalizedMethod === 'paymaya') return require('../assets/images/Maya_logo.png');
-    if (normalizedMethod === 'qrph') return require('../assets/images/QR_Ph_Logo.png');
-    return null;
-  };
+  const getMethodLogo = () => require('../assets/images/QR_Ph_Logo.png');
 
 
 
@@ -130,6 +129,8 @@ export default function Payment({navigation, route}) {
         title: payload.title,
         notes: payload.notes,
         amount: payload.amount,
+        attachmentUrl: payload.attachment_url,
+        attachmentName: payload.attachment_name,
         payload,
       });
 
@@ -140,6 +141,9 @@ export default function Payment({navigation, route}) {
 
       appointmentIdRef.current = appointmentId;
       appointmentCreatedRef.current = true;
+
+      // Bundled notarial is created AFTER successful payment (completePaidCheckout)
+      // so abandoned checkouts do not leave orphan "Payment pending" requests.
 
       return {
         appointmentId,
@@ -155,10 +159,27 @@ export default function Payment({navigation, route}) {
     }
   };
 
-  const cleanupPendingAppointment = async () => {
-    if (!appointmentCreatedRef.current) return;
-    const appointmentId = appointmentIdRef.current;
-    if (!appointmentId) return;
+  const resetBookingCheckoutState = () => {
+    appointmentIdRef.current = null;
+    appointmentCreatedRef.current = false;
+    transactionIdRef.current = null;
+    setCheckoutSession(null);
+    bookingPromiseRef.current = null;
+  };
+
+  const releaseUnpaidConsultationBooking = async () => {
+    const isConsultation =
+      paymentContext?.sourceType === 'appointment' ||
+      paymentContext?.sourceType === 'appointment_booking';
+    if (!isConsultation) return;
+
+    const appointmentId =
+      appointmentIdRef.current ||
+      (paymentContext?.sourceType === 'appointment' ? paymentContext?.sourceId : null);
+    if (!appointmentId) {
+      resetBookingCheckoutState();
+      return;
+    }
 
     let clientId = clientIdRef.current;
     if (!clientId) {
@@ -181,12 +202,14 @@ export default function Payment({navigation, route}) {
       } else {
         await cancelPendingUnpaidBooking({ appointmentId });
       }
-    } catch (error) {
+    } catch {
       try {
         await cancelPendingUnpaidBooking({ appointmentId });
       } catch (fallbackError) {
         console.warn('[payment] cleanup failed', fallbackError?.message || fallbackError);
       }
+    } finally {
+      resetBookingCheckoutState();
     }
   };
 
@@ -218,51 +241,50 @@ export default function Payment({navigation, route}) {
     }
 
     if (paymentContext.sourceType === 'notarial') {
-      let attorneyId = paymentContext.attorneyId ?? null;
-      let amount = paymentContext.amount ?? null;
-      if (amount == null) {
-        const row = await fetchNotarialPaymentDetails(paymentContext.sourceId);
-        if (attorneyId == null) attorneyId = row.attorneyId ?? null;
-        if (amount == null) amount = row.amount;
-      }
-      // Attorney may not be assigned yet — admin will assign after reviewing the request.
-      return payForNotarialRequest({
-        requestId: paymentContext.sourceId,
-        clientId,
-        attorneyId,   // null is OK
-        amount: Number(amount || 0),
-        method: toPayApiMethod(paymentMethod),
-      });
+      const error = new Error('PayMongo checkout is required for notarial payments.');
+      error.code = 'PAYMONGO_REQUIRED';
+      throw error;
     }
 
     return { transactionId: null };
   };
 
   const buildPaymongoSession = async () => {
-    const { profile } = await getCurrentSessionProfile();
+    const profilePromise = getCurrentSessionProfile();
+    const { profile } = await profilePromise;
     const clientId = profile?.id;
     if (!clientId) {
       throw new Error('You must be signed in to complete payment.');
     }
     clientIdRef.current = clientId;
 
-    // ── Notarial flow ──────────────────────────────────────────────────────
     if (paymentContext?.sourceType === 'notarial') {
       if (!paymentContext?.sourceId) {
         throw new Error('Missing notarial request reference.');
       }
-      let amount = paymentContext?.amount ?? null;
-      if (amount == null) {
+      let attorneyId = paymentContext.attorneyId ?? null;
+      let amount = paymentContext.amount ?? null;
+      let serviceType = paymentContext.serviceType ?? null;
+      if (amount == null || serviceType == null) {
         const row = await fetchNotarialPaymentDetails(paymentContext.sourceId);
-        amount = row.amount;
+        if (attorneyId == null) attorneyId = row.attorneyId ?? null;
+        if (amount == null) amount = row.amount;
+        if (serviceType == null) serviceType = row.serviceType ?? null;
       }
-      const session = await payForNotarialSession({
+      await warmPaymentBackend();
+
+      const session = await payForNotarialCheckout({
         notarialRequestId: paymentContext.sourceId,
         clientId,
+        attorneyId,
         amount: Number(amount || 0),
+        serviceType,
         method: toPayApiMethod(paymentMethod),
-        methodTypes: PAYMONGO_METHOD_TYPES,
+        methodTypes: PAYMONGO_PAYMENT_METHOD_TYPES,
       });
+      appointmentIdRef.current = session.appointmentId || null;
+      notarialRequestIdRef.current = paymentContext.sourceId;
+      appointmentCreatedRef.current = Boolean(session.appointmentId);
       setCheckoutSession(session);
       transactionIdRef.current = session.transactionId || null;
       return session;
@@ -292,13 +314,15 @@ export default function Payment({navigation, route}) {
       if (amount == null) amount = row.amount;
     }
 
+    await warmPaymentBackend();
+
     const session = await payForAppointment({
       appointmentId,
       clientId,
       attorneyId,
       amount: Number(amount || 0),
       method: toPayApiMethod(paymentMethod),
-      methodTypes: PAYMONGO_METHOD_TYPES,
+      methodTypes: PAYMONGO_PAYMENT_METHOD_TYPES,
     });
 
     setCheckoutSession(session);
@@ -306,89 +330,244 @@ export default function Payment({navigation, route}) {
     return session;
   };
 
-  const openPaymongoCheckout = async () => {
-    if (isOpening || isPolling) return;
+  const completePaidCheckout = async (session) => {
+    const isNotarial = paymentContext?.sourceType === 'notarial';
+
+    if (isNotarial) {
+      const notarialRequestId =
+        notarialRequestIdRef.current || paymentContext?.sourceId || null;
+      if (notarialRequestId && clientIdRef.current) {
+        await finalizeNotarialAfterPaidCheckout({
+          notarialRequestId,
+          clientId: clientIdRef.current,
+          amount: paymentContext?.amount ?? null,
+          transactionId: session.transactionId,
+        });
+      }
+    } else {
+      try {
+        const appointmentId = appointmentIdRef.current || paymentContext?.sourceId || null;
+        await notifyAttorneyOfPaidBooking({ appointmentId });
+      } catch (notifyError) {
+        console.warn('[payment] notify attorney failed', notifyError?.message || notifyError);
+      }
+
+      // ── Bundled notarial: create after pay, then link the paid transaction ──
+      const payload = paymentContext?.payload || {};
+      if (payload.includeNotarial && clientIdRef.current) {
+        try {
+          const documentUrl = payload.notarialDocumentUrl || null;
+          const documentName = payload.notarialDocumentName || null;
+          if (!documentUrl && !documentName) {
+            throw new Error(
+              'Notarial document is missing. The consultation was paid, but the notarial request could not be created.',
+            );
+          }
+
+          const appointmentId =
+            appointmentIdRef.current || paymentContext?.sourceId || null;
+          const bundledNote = appointmentId
+            ? `Bundled with consultation appointment ${appointmentId}.`
+            : 'Bundled with consultation booking.';
+          const finalNotes = payload.notarialNotes
+            ? `${bundledNote}\n\nClient notes: ${payload.notarialNotes}`
+            : bundledNote;
+
+          let notarialId = notarialCreatedIdRef.current;
+          if (!notarialId) {
+            const notarialResult = await createNotarialRequest({
+              clientId: clientIdRef.current,
+              attorneyId: payload.attorney_id || null,
+              serviceType: payload.notarialServiceType || 'Affidavit of Loss',
+              notes: finalNotes,
+              documentUrl,
+              documentName,
+              amount: payload.notarialAddOnFee,
+            });
+            notarialId = notarialResult?.id || null;
+            notarialCreatedIdRef.current = notarialId;
+          }
+
+          if (!notarialId) {
+            throw new Error('Notarial request was not created.');
+          }
+
+          // Link the PayMongo-paid appointment transaction so Notary Status
+          // sees payment_status=paid (same as standalone notarial checkout).
+          await finalizeNotarialAfterPaidCheckout({
+            notarialRequestId: notarialId,
+            clientId: clientIdRef.current,
+            amount: payload.notarialAddOnFee || 0,
+            transactionId: session?.transactionId || transactionIdRef.current,
+          });
+
+          // Also record an explicit notarial transaction row (belt-and-suspenders).
+          try {
+            await markNotarialRequestPaid({
+              requestId: notarialId,
+              clientId: clientIdRef.current,
+              attorneyId: payload.attorney_id || null,
+              amount: payload.notarialAddOnFee || 0,
+              method: toPayApiMethod(paymentMethod),
+            });
+          } catch (markErr) {
+            console.warn(
+              '[payment] bundled notarial markPaid fallback failed',
+              markErr?.message || markErr,
+            );
+          }
+        } catch (notarialErr) {
+          console.warn(
+            '[payment] bundled notarial after-pay failed',
+            notarialErr?.message || notarialErr,
+          );
+          Alert.alert(
+            'Notarial request',
+            notarialErr?.message ||
+              'Consultation payment succeeded, but the notarial request could not be finalized. Open Notary Status to retry payment if needed.',
+          );
+        }
+      }
+    }
+
+    setPaymentStatus('paid');
+    navigation.replace('PaymentSuccessful', {
+      amount: serviceData.amount,
+      transactionId: session.transactionId,
+      paymentContext,
+      serviceData,
+    });
+  };
+
+  const waitForPaidCheckout = async (session) => {
+    if (!session?.transactionId) {
+      throw new Error('Missing transaction reference.');
+    }
+
+    const startedAt = Date.now();
+    const timeoutMs = 5 * 60 * 1000;
+    let paid = false;
+    let pollDelayMs = PAYMENT_POLL_INITIAL_MS;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      if (cancelPaymentRef.current) {
+        throw new Error('Payment was cancelled. Your booking has been released.');
+      }
+
+      const statusResult = await getAppointmentPaymentStatus(session.transactionId);
+      const status = String(statusResult?.status || 'pending').toLowerCase();
+
+      if (status === 'paid') {
+        paid = true;
+        break;
+      }
+      if (status === 'failed') {
+        throw new Error('Payment failed. Please try again.');
+      }
+
+      if (cancelPaymentRef.current) {
+        throw new Error('Payment was cancelled. Your booking has been released.');
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
+      pollDelayMs = Math.min(PAYMENT_POLL_MAX_MS, pollDelayMs + PAYMENT_POLL_BACKOFF_MS);
+    }
+
+    if (!paid) {
+      throw new Error(
+        'Payment is still pending. Complete checkout, then try again in a few seconds.',
+      );
+    }
+
+    await completePaidCheckout(session);
+  };
+
+  const handlePaymongoPayNow = async () => {
+    if (isPaying || sessionPreparing) return;
+
+    cancelPaymentRef.current = false;
+    let succeeded = false;
+
     try {
-      setIsOpening(true);
+      setIsPaying(true);
       setPaymentStatus('pending');
 
-      const session = checkoutSession || await buildPaymongoSession();
+      const { profile } = await getCurrentSessionProfile();
+      const clientId = profile?.id;
+      if (!clientId) {
+        throw new Error('You must be signed in to complete payment.');
+      }
+      clientIdRef.current = clientId;
+
+      await warmPaymentBackend();
+
+      const session = checkoutSession || (await buildPaymongoSession());
       if (!session?.checkoutUrl) {
         throw new Error('Checkout URL is missing. Please try again.');
       }
 
-      await WebBrowser.openBrowserAsync(session.checkoutUrl);
+      await WebBrowser.openBrowserAsync(session.checkoutUrl, {
+        dismissButtonStyle: 'close',
+        enableBarCollapsing: true,
+      });
+      await waitForPaidCheckout(session);
+      succeeded = true;
     } catch (error) {
       setPaymentStatus('failed');
-      await cleanupPendingAppointment();
-      Alert.alert('Payment Failed', error?.message ?? 'Unable to open payment checkout.');
+      if (!cancelPaymentRef.current) {
+        Alert.alert('Payment Failed', error?.message ?? 'Unable to complete payment. Please try again.');
+      }
     } finally {
-      setIsOpening(false);
+      if (!succeeded && isWebStyleConsultationPay) {
+        await releaseUnpaidConsultationBooking();
+      }
+      cancelPaymentRef.current = false;
+      setIsPaying(false);
     }
   };
 
-  const pollPaymentStatus = async () => {
-    if (isPolling) return;
+  const prefetchCheckoutSession = useCallback(async () => {
+    if (!canPrefetchCheckoutSession || checkoutSession || prefetchStartedRef.current) {
+      return;
+    }
+    prefetchStartedRef.current = true;
+    setSessionPreparing(true);
     try {
-      setIsPolling(true);
-      setPaymentStatus('pending');
-
-      const session = checkoutSession || await buildPaymongoSession();
-      if (!session?.transactionId) {
-        throw new Error('Missing transaction reference.');
-      }
-
-      const startedAt = Date.now();
-      const timeoutMs = 5 * 60 * 1000;
-      let paid = false;
-      let pollDelayMs = 2500;
-      const isNotarial = paymentContext?.sourceType === 'notarial';
-
-      while (Date.now() - startedAt < timeoutMs) {
-        await new Promise(resolve => setTimeout(resolve, pollDelayMs));
-
-        const statusResult = isNotarial
-          ? await getNotarialPaymentStatus(session.transactionId)
-          : await getAppointmentPaymentStatus(session.transactionId);
-        const status = String(statusResult?.status || 'pending').toLowerCase();
-
-        if (status === 'paid') {
-          paid = true;
-          break;
-        }
-        if (status === 'failed') {
-          if (!isNotarial) await cleanupPendingAppointment();
-          throw new Error('Payment failed. Please try again.');
-        }
-        pollDelayMs = Math.min(6000, pollDelayMs + 500);
-      }
-
-      if (!paid) {
-        throw new Error('Payment is still pending. Complete checkout, then try again.');
-      }
-
-      // Notify attorney only for appointment flows
-      if (!isNotarial) {
-        try {
-          const appointmentId = appointmentIdRef.current || paymentContext?.sourceId || null;
-          await notifyAttorneyOfPaidBooking({ appointmentId });
-        } catch (notifyError) {
-          console.warn('[payment] notify attorney failed', notifyError?.message || notifyError);
-        }
-      }
-
-      setPaymentStatus('paid');
-      navigation.replace('PaymentSuccessful', {
-        amount: serviceData.amount,
-        transactionId: session.transactionId,
-        paymentContext,
-        serviceData,
-      });
+      await warmPaymentBackend();
+      await buildPaymongoSession();
     } catch (error) {
-      setPaymentStatus('failed');
-      Alert.alert('Payment Failed', error?.message ?? 'Unable to confirm payment. Please try again.');
+      console.warn('[payment] prefetch session failed', error?.message || error);
     } finally {
-      setIsPolling(false);
+      setSessionPreparing(false);
+    }
+  }, [canPrefetchCheckoutSession, checkoutSession]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    warmPaymentBackend().catch(() => {});
+
+    (async () => {
+      if (cancelled) return;
+
+      if (canPrefetchCheckoutSession) {
+        await prefetchCheckoutSession();
+        return;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [canPrefetchCheckoutSession, paymentContext?.sourceType, prefetchCheckoutSession]);
+
+  const handleCancelPayment = async () => {
+    cancelPaymentRef.current = true;
+    setIsPaying(false);
+    setPaymentStatus('failed');
+    await releaseUnpaidConsultationBooking();
+    if (navigation.canGoBack()) {
+      navigation.goBack();
     }
   };
 
@@ -400,9 +579,7 @@ export default function Payment({navigation, route}) {
       return;
     }
 
-    const needsSourceId =
-      paymentContext?.sourceType === 'notarial' ||
-      paymentContext?.sourceType === 'appointment';
+    const needsSourceId = paymentContext?.sourceType === 'appointment';
     if (needsSourceId && !paymentContext?.sourceId) {
       Alert.alert(
         'Cannot complete payment',
@@ -432,10 +609,16 @@ export default function Payment({navigation, route}) {
   };
 
   const handleCancel = async () => {
-    if (isPaymongoFlow) {
-      await cleanupPendingAppointment();
+    if (isPaying) {
+      await handleCancelPayment();
+      return;
     }
-    navigation.canGoBack() ? navigation.goBack() : null;
+    if (isWebStyleConsultationPay) {
+      await releaseUnpaidConsultationBooking();
+    }
+    if (navigation.canGoBack()) {
+      navigation.goBack();
+    }
   };
 
   const handleKeyPress = (digit) => {
@@ -517,7 +700,13 @@ export default function Payment({navigation, route}) {
         {isPaymongoFlow ? (
           <>
             <Text style={styles.instructionText}>
-              You will be redirected to the secure PayMongo checkout. Once payment is complete, return here to confirm.
+              {isPaying
+                ? 'Waiting for payment confirmation… For QR Ph, finish in your banking app, then return here. Use Cancel Payment to stop.'
+                : sessionPreparing
+                  ? 'Preparing secure checkout…'
+                  : checkoutSession
+                    ? 'Checkout is ready. Tap Pay Now to open PayMongo and complete payment.'
+                    : 'You will be redirected to secure PayMongo checkout. Payment is confirmed automatically when complete.'}
             </Text>
 
             <View style={styles.statusPill}>
@@ -533,33 +722,33 @@ export default function Payment({navigation, route}) {
               </Text>
             </View>
 
-            <TouchableOpacity
-              style={[styles.payButton, (isOpening || isPolling) && styles.payButtonDisabled]}
-              onPress={openPaymongoCheckout}
-              disabled={isOpening || isPolling}
-            >
-              {isOpening ? (
-                <ActivityIndicator size="small" color={T.base} />
-              ) : (
-                <Text style={styles.payButtonText}>Open Secure Checkout</Text>
-              )}
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.secondaryButton, isPolling && styles.payButtonDisabled]}
-              onPress={pollPaymentStatus}
-              disabled={isPolling}
-            >
-              {isPolling ? (
-                <ActivityIndicator size="small" color={T.gold[1]} />
-              ) : (
-                <Text style={styles.secondaryButtonText}>I Completed Payment</Text>
-              )}
-            </TouchableOpacity>
-
-            <TouchableOpacity style={styles.cancelButton} onPress={handleCancel}>
-              <Text style={styles.cancelText}>Cancel and go back</Text>
-            </TouchableOpacity>
+            {isPaying ? (
+              <>
+                <ActivityIndicator size="small" color={T.gold[1]} style={{ marginBottom: 16 }} />
+                <TouchableOpacity style={styles.secondaryButton} onPress={handleCancelPayment}>
+                  <Text style={styles.secondaryButtonText}>Cancel Payment</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <>
+                <TouchableOpacity
+                  style={[
+                    styles.payButton,
+                    (isPaying || sessionPreparing) && styles.payButtonDisabled,
+                  ]}
+                  onPress={handlePaymongoPayNow}
+                  disabled={isPaying || sessionPreparing}>
+                  {isPaying || sessionPreparing ? (
+                    <ActivityIndicator size="small" color={T.base} />
+                  ) : (
+                    <Text style={styles.payButtonText}>Pay Now</Text>
+                  )}
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.cancelButton} onPress={handleCancel}>
+                  <Text style={styles.cancelText}>← Back</Text>
+                </TouchableOpacity>
+              </>
+            )}
           </>
         ) : (
           <>

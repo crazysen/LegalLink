@@ -19,7 +19,6 @@ const lightGray = '#F3F4F6';
 
 export default function CreateAccount({ navigation }) {
   const {updateProfile} = useUserProfile();
-  const [isClient, setIsClient] = useState(true);
   const [contactNumber, setContactNumber] = useState('');
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
@@ -27,10 +26,6 @@ export default function CreateAccount({ navigation }) {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const [age, setAge] = useState('');
-  const [address, setAddress] = useState('');
-  const [guardianName, setGuardianName] = useState('');
-  const [guardianContact, setGuardianContact] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const validateAndSubmit = async () => {
@@ -51,17 +46,7 @@ export default function CreateAccount({ navigation }) {
     if (contactNumber.length < 10 || contactNumber.length > 13) return Alert.alert('Error', 'Contact number must be 10-13 digits');
     if (!contactNumber.startsWith('0') && !contactNumber.startsWith('9')) return Alert.alert('Error', 'Contact number must start with 0 or 9 (e.g. 09171234567)');
 
-    if (!age) return Alert.alert('Error', 'Age is required');
-    if (isNaN(age) || parseInt(age) < 1) return Alert.alert('Error', 'Enter a valid age');
-    if (!address) return Alert.alert('Error', 'Address is required');
-
-    const parsedAge = parseInt(age);
-    if (parsedAge < 18) {
-      if (!guardianName) return Alert.alert('Error', 'Guardian full name is required for minors');
-      if (!guardianContact) return Alert.alert('Error', 'Guardian contact number is required for minors');
-    }
-
-    const role = isClient ? 'Client' : 'Attorney';
+    const role = 'Client';
 
     try {
       setIsSubmitting(true);
@@ -72,20 +57,12 @@ export default function CreateAccount({ navigation }) {
         fullName: fullName.trim(),
         role,
         phone: contactNumber.trim(),
-        age: parseInt(age),
-        address: address.trim(),
-        guardianName: parsedAge < 18 ? guardianName.trim() : null,
-        guardianContact: parsedAge < 18 ? guardianContact.trim() : null,
       });
 
       updateProfile({
         name: fullName.trim(),
         email: email.trim(),
         phone: contactNumber.trim(),
-        address: address.trim(),
-        age: parseInt(age),
-        guardian_name: parsedAge < 18 ? guardianName.trim() : '',
-        guardian_contact: parsedAge < 18 ? guardianContact.trim() : '',
         role,
       });
 
@@ -98,10 +75,6 @@ export default function CreateAccount({ navigation }) {
           fullName: fullName.trim(),
           email: email.trim(),
           role,
-          age: parseInt(age),
-          address: address.trim(),
-          guardianName: parsedAge < 18 ? guardianName.trim() : null,
-          guardianContact: parsedAge < 18 ? guardianContact.trim() : null,
         },
       });
     } catch (error) {
@@ -127,20 +100,8 @@ export default function CreateAccount({ navigation }) {
 
         <View style={styles.formContainer}>
         <Text style={styles.title}>Create Profile</Text>
-        <Text style={styles.subtitle}>Join the BatasMo legal network.</Text>
+        <Text style={styles.subtitle}>Join the LegalLink legal network.</Text>
 
-        <View style={styles.toggleContainer}>
-          <TouchableOpacity
-            style={[styles.toggleOption, isClient && styles.activeToggle]}
-            onPress={() => setIsClient(true)}>
-            <Text style={[styles.toggleText, isClient && styles.activeText]}>Client</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.toggleOption, !isClient && styles.activeToggle]}
-            onPress={() => setIsClient(false)}>
-            <Text style={[styles.toggleText, !isClient && styles.activeText]}>Attorney</Text>
-          </TouchableOpacity>
-        </View>
 
         {/* Full Name */}
         <Text style={styles.label}>Full Name</Text>
@@ -164,53 +125,6 @@ export default function CreateAccount({ navigation }) {
           onChangeText={setContactNumber}
           maxLength={11}
         />
-
-        {/* Age */}
-        <Text style={styles.label}>Age</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="21"
-          placeholderTextColor="#94A3B8"
-          keyboardType="number-pad"
-          value={age}
-          onChangeText={setAge}
-          maxLength={3}
-        />
-
-        {/* Address */}
-        <Text style={styles.label}>Address</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="123 Legal St. Manila City"
-          placeholderTextColor="#94A3B8"
-          value={address}
-          onChangeText={setAddress}
-          maxLength={255}
-        />
-
-        {/* Guardian details if Minor */}
-        {parseInt(age) > 0 && parseInt(age) < 18 && (
-          <>
-            <Text style={styles.label}>Guardian Full Name</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Guardian's Name"
-              value={guardianName}
-              onChangeText={setGuardianName}
-              maxLength={100}
-            />
-
-            <Text style={styles.label}>Guardian Contact Number</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="09171234567"
-              value={guardianContact}
-              onChangeText={setGuardianContact}
-              keyboardType="phone-pad"
-              maxLength={11}
-            />
-          </>
-        )}
 
         {/* Email */}
         <Text style={styles.label}>Email Address</Text>

@@ -6,6 +6,27 @@ import {
 } from './supabaseClient';
 import { clearCachedProfile } from './profileCache';
 import { clearMemoryProfileCache } from './profileSessionMemory';
+import {
+  isValidEmail,
+  isGmailEmail,
+  isPhilippineMobile,
+  isStrongPassword,
+  GMAIL_REQUIRED_MESSAGE,
+  PH_MOBILE_REQUIRED_MESSAGE,
+  VALID_PASSWORD_MESSAGE,
+  normalizeAuthEmail,
+} from '../utils/validators';
+import {
+  isSignupVerificationComplete,
+  signOutIfSignupIncomplete,
+} from './signupVerification';
+import { resolvePaymentBackendUrl } from './paymentApiClient';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+export const PENDING_SIGNUP_ID_KEY = '@legallink/pending_signup_id';
+export const OTP_RESUME_SIGNUP_KEY = '@legallink/otp_resume_signup';
+
+const getBackendApiBase = () => resolvePaymentBackendUrl();
 
 /** Philippine mobile → E.164 (+639XXXXXXXXX). */
 export function normalizePhilippinesToE164(input) {
@@ -78,12 +99,8 @@ export async function signUpWithEmail({
   fullName,
   role,
   phone,
-  age,
-  address,
-  guardianName,
-  guardianContact,
-  verificationMethod = 'sms'
 }) {
+  const normalizedEmail = normalizeAuthEmail(email);
   const normalizedRole = String(role || 'Client').toLowerCase();
   const roleValue =
     normalizedRole === 'attorney'
@@ -92,107 +109,119 @@ export async function signUpWithEmail({
         ? 'Admin'
         : 'Client';
 
-  const wantsSmsVerification = verificationMethod === 'sms';
-
-  async function sendEmailVerificationOtp(targetEmail) {
-    const { error } = await supabase.auth.signInWithOtp({
-      email: targetEmail,
-      options: { shouldCreateUser: false },
-    });
-    if (error) {
-      throw new Error(error.message || 'Failed to send email verification code.');
-    }
-    return { success: true };
+  if (!String(fullName || '').trim()) {
+    throw new Error('Full name is required.');
+  }
+  if (!isGmailEmail(normalizedEmail)) {
+    throw new Error(GMAIL_REQUIRED_MESSAGE);
+  }
+  if (!isPhilippineMobile(phone)) {
+    throw new Error(PH_MOBILE_REQUIRED_MESSAGE);
+  }
+  if (!isStrongPassword(password)) {
+    throw new Error(VALID_PASSWORD_MESSAGE);
   }
 
-  if (!phone || !String(phone).trim()) {
-    throw new Error('Mobile number is required to create your account.');
+
+
+  const base = getBackendApiBase();
+  if (!base) {
+    throw new Error(
+      'Signup is not configured. Set EXPO_PUBLIC_PAYMENT_API_URL to your Render backend URL.',
+    );
   }
 
-  const phoneE164 = normalizePhilippinesToE164(phone);
-
-  const { data, error } = await supabase.auth.signUp({
-    email,
-    password,
-    options: {
-      data: {
-        full_name: fullName,
-        role: roleValue,
-      },
-    },
+  const response = await fetch(`${base}/auth/signup-start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: normalizedEmail,
+      password,
+      fullName: String(fullName).trim(),
+      role: roleValue,
+      phone: String(phone).trim(),
+      preferredOtpChannel: 'email',
+    }),
   });
 
-  if (error) {
-    const message = String(error.message || 'Sign up failed.');
-    const lower = message.toLowerCase();
-    if (lower.includes('email signups are disabled')) {
-      throw new Error(
-        'Email signups are disabled in Supabase. Enable Authentication → Providers → Email. ' +
-          'SMS verification still requires Email signups because accounts are created with email + password.',
-      );
-    }
-    throw new Error(message);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.error || 'Failed to start signup.');
   }
 
-  const emailConfirmed = Boolean(data?.user?.email_confirmed_at);
-
-  if (!data?.session || !data.user) {
-    if (wantsSmsVerification) {
-      throw new Error(
-        'Could not start your session after sign-up. To use SMS verification, disable "Confirm email" in Supabase or choose Email verification during sign up.',
-      );
-    }
-    return {
-      token: null,
-      user: data?.user,
-      phoneE164,
-      emailConfirmed,
-    };
+  const pendingId = payload?.pendingId ? String(payload.pendingId) : '';
+  if (pendingId) {
+    await AsyncStorage.setItem(PENDING_SIGNUP_ID_KEY, pendingId);
   }
-
-  if (wantsSmsVerification) {
-    const { error: phoneErr } = await supabase.auth.updateUser({ phone: phoneE164 });
-    if (phoneErr) {
-      throw new Error(phoneErr.message || 'Failed to send verification SMS.');
-    }
-  } else {
-    await sendEmailVerificationOtp(email);
-  }
-
-  const phoneForProfile = e164ToPhilippinesLocal11(phoneE164 || phone);
-
-  const { error: profileError } = await supabase.from('profiles').upsert(
-    {
-      id: data.user.id,
-      email: email,
-      full_name: fullName,
-      role: roleValue,
-      phone: phoneForProfile,
-      age: age || null,
-      address: address || null,
-      guardian_name: guardianName || null,
-      guardian_contact: guardianContact || null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: 'id' },
+  await AsyncStorage.setItem(
+    OTP_RESUME_SIGNUP_KEY,
+    JSON.stringify({
+      email: normalizedEmail,
+      password: String(password || ''),
+    }),
   );
 
-  if (profileError) {
-    console.error('Failed to create profile:', profileError);
+  let phoneE164 = null;
+  try {
+    phoneE164 = normalizePhilippinesToE164(phone);
+  } catch {
+    phoneE164 = null;
   }
 
-  data.user.role = roleValue;
-  data.user.name = fullName;
-  data.user.phone = phoneE164 || phone;
-  data.user.address = address;
-
   return {
-    token: data?.session?.access_token,
-    user: data?.user,
+    pendingId,
+    email: payload?.email || normalizedEmail,
     phoneE164,
-    emailConfirmed,
+    preferredOtpChannel: 'email',
   };
+}
+
+export async function sendSignupVerificationEmail({ email, pendingId }) {
+  const normalizedEmail = normalizeAuthEmail(email);
+  if (!normalizedEmail && !pendingId) throw new Error('Email is required.');
+
+  const base = getBackendApiBase();
+  if (!base) {
+    throw new Error('Signup service is not configured (EXPO_PUBLIC_PAYMENT_API_URL).');
+  }
+
+  const body = {};
+  if (normalizedEmail) body.email = normalizedEmail;
+  if (pendingId) body.pendingId = String(pendingId).trim();
+
+  const response = await fetch(`${base}/auth/signup-resend-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.error || 'Failed to send verification email.');
+  }
+  return payload;
+}
+
+export async function completePendingSignup({ email, pendingId, otp, password }) {
+  const base = getBackendApiBase();
+  if (!base) {
+    throw new Error('Signup service is not configured (EXPO_PUBLIC_PAYMENT_API_URL).');
+  }
+
+  const response = await fetch(`${base}/auth/signup-complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: normalizeAuthEmail(email),
+      pendingId: pendingId ? String(pendingId).trim() : undefined,
+      otp: String(otp || '').replace(/\D/g, ''),
+      password: String(password || ''),
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.error || 'Verification failed.');
+  }
+  return payload;
 }
 
 /**
@@ -213,7 +242,10 @@ export async function checkEmailLockout(email) {
   }
   try {
     const { data } = await supabase.rpc('check_login_lockout', { user_email: email });
-    return Number(data) || 0;
+    if (typeof data === 'boolean') {
+      return data ? 600 : 0;
+    }
+    return Math.max(0, Math.floor(Number(data) || 0));
   } catch (error) {
     return 0;
   }
@@ -255,6 +287,13 @@ export async function signInWithEmail({ email, password }) {
     .trim()
     .toLowerCase();
 
+  if (!normalizedEmail || !password) {
+    throw new Error('Email and password are required.');
+  }
+  if (!isValidEmail(normalizedEmail)) {
+    throw new Error('Please enter a valid email address.');
+  }
+
   const lockoutTime = await checkEmailLockout(normalizedEmail);
   if (lockoutTime > 0) {
     throw new Error(`LOCKOUT:${lockoutTime}`);
@@ -276,19 +315,30 @@ export async function signInWithEmail({ email, password }) {
     const rawMsg = String(error.message || '');
     const low = rawMsg.toLowerCase();
     const code = String(error.code ?? '').toLowerCase();
-    console.warn('[BatasMo] signInWithPassword', {
+    console.warn('[LegalLink] signInWithPassword', {
       message: rawMsg,
       status: error.status,
       code: code || undefined,
       name: error.name,
     });
 
-    if (shouldLogFailedPasswordAttempt(rawMsg)) {
+    const normalizedErr = low;
+    if (
+      normalizedErr.includes('credential') ||
+      normalizedErr.includes('invalid login') ||
+      normalizedErr.includes('invalid email or password') ||
+      shouldLogFailedPasswordAttempt(rawMsg)
+    ) {
       try {
         await supabase.rpc('log_failed_login', { user_email: normalizedEmail });
       } catch (e) {
         console.warn('log_failed_login:', e?.message || e);
       }
+    }
+
+    const lockoutAfter = await checkEmailLockout(normalizedEmail);
+    if (lockoutAfter > 0) {
+      throw new Error(`LOCKOUT:${lockoutAfter}`);
     }
 
     if (
@@ -303,27 +353,18 @@ export async function signInWithEmail({ email, password }) {
       );
     }
 
+    const showRaw =
+      typeof process.env.EXPO_PUBLIC_AUTH_DEBUG === 'string' &&
+      ['1', 'true', 'yes'].includes(process.env.EXPO_PUBLIC_AUTH_DEBUG.toLowerCase().trim());
+    if (showRaw && (low.includes('invalid') || low.includes('credential'))) {
+      throw new Error(`Incorrect password. Raw: ${rawMsg}`);
+    }
     if (
       low.includes('invalid login credentials') ||
-      low.includes('invalid email or password')
+      low.includes('invalid email or password') ||
+      (low.includes('invalid') && low.includes('credential'))
     ) {
-      const { hostname, urlFromEnv, keyFromEnv } = getSupabaseEnvDebug();
-      const hostBit = hostname ? ` (${hostname})` : '';
-      let detail =
-        `Invalid email or password for this app${hostBit}. ` +
-        'In Supabase Dashboard → Authentication → Users, confirm this exact email exists in this project, then use Reset password or set a new password. ' +
-        'If you only sign in with Google (or Apple) on the web, the account may have no password yet—set one in the dashboard for that user.';
-      if (!urlFromEnv || !keyFromEnv) {
-        detail +=
-          ' This build is missing EXPO_PUBLIC_SUPABASE_URL and/or EXPO_PUBLIC_SUPABASE_ANON_KEY from a .env file next to app.json (BatasMoApp folder). Copy the same values as your web app, then stop Expo and run: npx expo start -c';
-      }
-      const showRaw =
-        typeof process.env.EXPO_PUBLIC_AUTH_DEBUG === 'string' &&
-        ['1', 'true', 'yes'].includes(process.env.EXPO_PUBLIC_AUTH_DEBUG.toLowerCase().trim());
-      if (showRaw) {
-        detail += ` Raw: ${rawMsg}`;
-      }
-      throw new Error(detail);
+      throw new Error('Incorrect password.');
     }
     throw new Error(rawMsg);
   }
@@ -336,6 +377,14 @@ export async function signInWithEmail({ email, password }) {
 
   const { data: freshAuth } = await supabase.auth.getUser();
   const authedUser = freshAuth?.user || data?.user;
+
+  if (authedUser && !isSignupVerificationComplete(authedUser)) {
+    await signOutIfSignupIncomplete(authedUser);
+    const err = new Error('SIGNUP_OTP_REQUIRED');
+    err.code = 'SIGNUP_OTP_REQUIRED';
+    err.email = normalizedEmail;
+    throw err;
+  }
 
   if (authedUser) {
     const meta = authedUser.user_metadata || {};
@@ -405,31 +454,8 @@ export async function signOutCurrentUser() {
   }
 }
 
-/** Email OTP — same Supabase flow as `batasmo_web` `lib/authService.js`. */
-export async function verifySignUpOtp({ email, token }) {
-  const firstAttempt = await supabase.auth.verifyOtp({ email, token, type: 'signup' });
-  if (!firstAttempt.error) {
-    return { success: true };
-  }
-  const secondAttempt = await supabase.auth.verifyOtp({ email, token, type: 'email' });
-  if (secondAttempt.error) {
-    throw new Error(secondAttempt.error.message);
-  }
-  return { success: true };
-}
-
-export async function resendSignUpOtp({ email }) {
-  const { error } = await supabase.auth.resend({ type: 'signup', email });
-  if (error) {
-    const { error: fallback } = await supabase.auth.signInWithOtp({
-      email,
-      options: { shouldCreateUser: false },
-    });
-    if (fallback) {
-      throw new Error(fallback.message || error.message);
-    }
-  }
-  return { success: true };
+export async function resendSignUpOtp({ email, pendingId }) {
+  return sendSignupVerificationEmail({ email, pendingId });
 }
 
 /** Triggers or re-sends SMS OTP for the current session (e.g. phone change / verification). */

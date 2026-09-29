@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { warmPaymentBackend } from '../services/paymentApiClient';
 import {
   Alert,
   StyleSheet,
@@ -9,13 +10,18 @@ import {
   Image,
 } from 'react-native';
 import { REFERENCE_THEME as T } from '../constants/referenceTheme';
+import { DEFAULT_PAYMENT_METHOD } from '../constants/paymentConfig';
 import { ClientScreenShell, ClientFadeInSoft } from '../components/ClientScreenShell';
 
 export default function BookingSummary({navigation, route}) {
-  const [paymentMethod, setPaymentMethod] = useState('gcash');
+  const paymentMethod = DEFAULT_PAYMENT_METHOD;
   const serviceData = route?.params?.serviceData || { type: 'Power of Attorney', date: 'February 15, 2026', time: '2:00 PM', amount: '₱2,500' };
   const paymentContext = route?.params?.paymentContext || null;
   const isNotarial = paymentContext?.sourceType === 'notarial';
+
+  useEffect(() => {
+    warmPaymentBackend().catch(() => {});
+  }, []);
 
   const handleProceedToPayment = () => {
     if (isNotarial && !paymentContext?.sourceId) {
@@ -31,27 +37,6 @@ export default function BookingSummary({navigation, route}) {
   const handleClose = () => {
     navigation.canGoBack() ? navigation.goBack() : null;
   };
-
-  const PaymentOption = ({ id, label, source }) => (
-    <TouchableOpacity 
-      style={[
-        styles.paymentCard, 
-        paymentMethod === id && styles.paymentCardActive
-      ]}
-      onPress={() => setPaymentMethod(id)}
-    >
-      <View style={styles.paymentIconContainer}>
-        <Image source={source} style={styles.paymentLogoImage} resizeMode="contain" />
-      </View>
-      <Text style={styles.paymentLabel}>{label}</Text>
-      <View style={[
-        styles.radioCircle, 
-        paymentMethod === id && styles.radioCircleActive
-      ]}>
-        {paymentMethod === id && <View style={styles.radioInner} />}
-      </View>
-    </TouchableOpacity>
-  );
 
   return (
     <ClientScreenShell>
@@ -99,11 +84,17 @@ export default function BookingSummary({navigation, route}) {
             </View>
           </View>
 
-          <Text style={styles.selectionTitle}>Select Payment Method</Text>
-          
-          <PaymentOption id="gcash" label="GCash" source={require('../assets/images/Gcash_logo.png')} />
-          <PaymentOption id="maya" label="Maya" source={require('../assets/images/Maya_logo.png')} />
-          <PaymentOption id="qrph" label="QR Ph" source={require('../assets/images/QR_Ph_Logo.png')} />
+          <Text style={styles.selectionTitle}>Payment Method</Text>
+          <View style={[styles.paymentCard, styles.paymentCardActive]}>
+            <View style={styles.paymentIconContainer}>
+              <Image
+                source={require('../assets/images/QR_Ph_Logo.png')}
+                style={styles.paymentLogoImage}
+                resizeMode="contain"
+              />
+            </View>
+            <Text style={styles.paymentLabel}>QR Ph — scan to pay</Text>
+          </View>
 
           <TouchableOpacity style={styles.proceedButton} onPress={handleProceedToPayment}>
             <Text style={styles.proceedButtonText}>Proceed to Payment</Text>

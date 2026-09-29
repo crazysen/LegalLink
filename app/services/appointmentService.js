@@ -2,7 +2,10 @@ import { supabase } from './supabaseClient';
 import {
   createAppointmentBooking,
   fetchAvailability as fetchAvailabilityFromUserApi,
+  isConsultationChatWindowOpen,
+  buildChatScheduleBlockedMessage,
 } from './userApi';
+import { sortAvailabilitySlotsChronologically } from './availabilityScheduleUtils';
 
 /**
  * Hourly grid labels — must match AttyAvailabilityManager ALL_SLOTS.
@@ -137,7 +140,7 @@ let appointmentsCache = {
   updatedAt: 0,
 };
 
-function invalidateAppointmentsCache() {
+export function invalidateAppointmentsCache() {
   appointmentsCache = {
     data: null,
     updatedAt: 0,
@@ -382,8 +385,33 @@ export async function getMyAppointments(options = {}) {
     }
   }
 
+  const withChatAccess = result.map((item) => {
+    const status = item?.status
+    const statusLower = String(status || '').toLowerCase()
+    const chatWindowOpen = isConsultationChatWindowOpen({
+      status,
+      scheduledAt: item?.scheduled_at,
+      slotDate: item?.slot_date,
+      slotTime: item?.slot_time,
+    })
+    const chatAccessible = statusLower === 'completed' ? true : chatWindowOpen
+    const chatBlockedMessage = chatAccessible
+      ? ''
+      : buildChatScheduleBlockedMessage({
+          scheduledAt: item?.scheduled_at,
+          slotDate: item?.slot_date,
+          slotTime: item?.slot_time,
+        })
+
+    return {
+      ...item,
+      chatAccessible,
+      chatBlockedMessage,
+    }
+  })
+
   appointmentsCache = {
-    data: result,
+    data: withChatAccess,
     updatedAt: Date.now(),
   };
 
@@ -430,9 +458,11 @@ export async function createAppointment(payload) {
   }
 
   const paymentMethod = String(
-    payload?.payment_method || 'gcash',
+    payload?.payment_method || 'qrph',
   ).toLowerCase();
   const paymentReference = payload?.payment_reference || null;
+  const attachmentUrl = payload?.attachment_url ?? null
+  const attachmentName = payload?.attachment_name ?? null
 
   await createAppointmentBooking({
     clientId: user.id,
@@ -444,6 +474,8 @@ export async function createAppointment(payload) {
     paymentMethod,
     paymentCode: paymentReference,
     paymentReference,
+    attachmentUrl,
+    attachmentName,
     payload: {
       attorney_id: payload.attorney_id,
       title: payload.title || 'Legal Consultation',
@@ -454,6 +486,8 @@ export async function createAppointment(payload) {
       slot_id: slotId,
       amount: Number(payload.amount || 0),
       duration_minutes: Number(payload.duration_minutes || 60),
+      attachment_url: attachmentUrl,
+      attachment_name: attachmentName,
     },
   });
 
@@ -843,22 +877,30 @@ export async function rescheduleAppointment(appointmentId, scheduledAt, reason) 
  */
 export async function getAvailability(attorneyId, date) {
   const rows = await fetchAvailabilityFromUserApi(attorneyId, date);
-  return rows
+  const mapped = rows
     .map(r => {
       let timeStr = '';
-      if (r.time) {
-        timeStr = normalizeSlotTimeLabel(String(r.time).trim());
-      } else if (r.startTime) {
+      if (r.startTime) {
         const {time} = scheduledAtToLocalSlotDateTime(r.startTime);
         timeStr = time ? normalizeSlotTimeLabel(time) : '';
+      }
+      if (!timeStr && r.time) {
+        const candidate = normalizeSlotTimeLabel(String(r.time).trim());
+        timeStr =
+          parseSlotTimeToMinutes(candidate) !== null
+            ? candidate
+            : '';
       }
       return {
         id: r.id,
         date: r.date || date,
         time: timeStr,
+        startTime: r.startTime,
       };
     })
     .filter(s => s.id && s.time);
+
+  return sortAvailabilitySlotsChronologically(mapped);
 }
 
 function normalizeAvailabilityDate(d) {

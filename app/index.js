@@ -1,17 +1,26 @@
 import 'react-native-gesture-handler';
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useState} from 'react';
+import {ActivityIndicator, StyleSheet, View} from 'react-native';
 import {registerRootComponent} from 'expo';
 import {StatusBar} from 'expo-status-bar';
 import * as SystemUI from 'expo-system-ui';
 import {GestureHandlerRootView} from 'react-native-gesture-handler';
 import {SafeAreaProvider} from 'react-native-safe-area-context';
-import {DarkTheme, NavigationContainer, createNavigationContainerRef} from '@react-navigation/native';
+import {DarkTheme, NavigationContainer} from '@react-navigation/native';
+import {navigationRef} from './navigation/navigationRef';
+
+export {navigationRef};
 import {
   supabase,
   recoverFromInvalidAuthSession,
   isInvalidRefreshTokenError,
 } from './services/supabaseClient';
-import {normalizePhilippinesToE164, isEmailVerified} from './services/authService';
+import {
+  normalizePhilippinesToE164,
+  isEmailVerified,
+  isPhoneVerified,
+} from './services/authService';
+import {isSignupVerificationComplete} from './services/signupVerification';
 import {REFERENCE_THEME as NavBase} from './constants/referenceTheme';
 import {createNativeStackNavigator} from '@react-navigation/native-stack';
 import LandingPage from './screens/LandingPage';
@@ -23,9 +32,11 @@ import AttyLandingPage from './screens/AttyLandingPage';
 import AttyMenu from './screens/AttyMenu';
 import ClientMenu from './screens/ClientMenu';
 import ClientNotification from './screens/ClientNotification';
+import ClientAnnouncementDetail from './screens/ClientAnnouncementDetail';
 import ClientSupportMessages from './screens/ClientSupportMessages';
 import BookAppointment from './screens/BookAppointment';
 import ClientNotarial from './screens/ClientNotarial';
+import ClientNotaryStatus from './screens/ClientNotaryStatus';
 import VerifyAccount from './screens/VerifyAccount';
 import AccountCreated from './screens/AccountCreated';
 import ProfileSettingsClient from './screens/ProfileSettingsClient';
@@ -48,9 +59,11 @@ import NotarialRequestSubmitted from './screens/NotarialRequestSubmitted.js';
 import PaymentMethod from './screens/PaymentMethod.js';
 import UploadIDScreen from './screens/UploadIDScreen.js';
 import FaceRecognitionScreen from './screens/FaceRecognitionScreen.js';
-import {UserProfileProvider} from './context/UserProfileContext';
+import DiditWorkflowVerificationScreen from './screens/DiditWorkflowVerificationScreen.js';
+import {UserProfileProvider, useUserProfile} from './context/UserProfileContext';
 import {NotificationProvider} from './context/NotificationContext';
 import InAppNotificationToast from './components/InAppNotificationToast';
+import ConsultationPeerEntryHost from './components/ConsultationPeerEntryHost';
 import AttyConsultationMessage from './screens/AttyConsultationMessage';
 import AttyMyEarnings from './screens/AttyMyEarnings';
 import AttyAnalytics from './screens/AttyAnalytics';
@@ -60,6 +73,7 @@ import AttySuccessWithdrawal from './screens/AttySuccessWithdrawal';
 import AttyProfileSettings from './screens/AttyProfileSettings';
 import AttyAvailabilityManager from './screens/AttyAvailabilityManager';
 import AttyMyAppointments from './screens/AttyMyAppointments';
+import AttyConsultationRequests from './screens/AttyConsultationRequests';
 import AdminCreateAttorney from './screens/AdminCreateAttorney';
 import ConsultationTranscript from './screens/ConsultationTranscript';
 import ClientConsultationLogs from './screens/ClientConsultationLogs';
@@ -68,10 +82,9 @@ import AttyAnnouncements from './screens/AttyAnnouncements';
 import ConsultationVideoCallScreen from './screens/ConsultationVideoCallScreen';
 import {createAppLinking} from './navigation/linkingConfig';
 import {flushPendingDeepLink} from './navigation/pendingDeepLink';
+import {ensureAppConfigLoaded, subscribeToAppConfigChanges} from './services/userApi';
 
 const Stack = createNativeStackNavigator();
-
-export const navigationRef = createNavigationContainerRef();
 
 const navigationTheme = {
   ...DarkTheme,
@@ -86,12 +99,172 @@ const navigationTheme = {
   },
 };
 
+function tryE164(v) {
+  if (!v) return null;
+  try {
+    return normalizePhilippinesToE164(String(v));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeAppRole(raw) {
+  const roleLower = String(raw || '').toLowerCase();
+  if (roleLower === 'attorney') return 'Attorney';
+  if (roleLower === 'admin') return 'Admin';
+  return 'Client';
+}
+
+function homeRouteForRole(role) {
+  return role === 'Attorney' ? 'AttyLandingPage' : 'HomepageClient';
+}
+
+/**
+ * Restores a persisted Supabase session on cold start and routes past Landing
+ * so users only sign in once until they explicitly log out.
+ */
+function AuthSessionBootstrap({navReady, onDone}) {
+  const {updateProfile} = useUserProfile();
+
+  useEffect(() => {
+    if (!navReady) {
+      return;
+    }
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const {
+          data: {session},
+          error: sessionError,
+        } = await supabase.auth.getSession();
+
+        if (sessionError && isInvalidRefreshTokenError(sessionError)) {
+          await recoverFromInvalidAuthSession();
+          return;
+        }
+
+        if (cancelled || !session?.user?.id) {
+          return;
+        }
+
+        if (!navigationRef.isReady()) {
+          return;
+        }
+
+        if (!isSignupVerificationComplete(session.user)) {
+          navigationRef.reset({
+            index: 0,
+            routes: [
+              {
+                name: 'VerifyAccount',
+                params: {
+                  email: session.user.email || '',
+                  role: session.user.user_metadata?.role || 'Client',
+                  isNewSignup: true,
+                  verificationMethod: 'email',
+                  profilePayload: null,
+                },
+              },
+            ],
+          });
+          return;
+        }
+
+        const {data: prof} = await supabase
+          .from('profiles')
+          .select('role, phone, full_name, address, email')
+          .eq('id', session.user.id)
+          .maybeSingle();
+
+        if (cancelled) {
+          return;
+        }
+
+        const normalizedRole = normalizeAppRole(
+          prof?.role || session.user.user_metadata?.role || session.user.app_metadata?.role,
+        );
+
+        updateProfile({
+          email: prof?.email || session.user.email || '',
+          name: prof?.full_name || session.user.user_metadata?.full_name || 'LegalLink User',
+          phone: prof?.phone || session.user.phone || '',
+          address: prof?.address || '',
+          role: normalizedRole,
+        });
+
+        // Admin tools live on web — leave them on Landing.
+        if (normalizedRole === 'Admin') {
+          return;
+        }
+
+        const isAttorney = normalizedRole === 'Attorney';
+        const needsPhoneVerification =
+          !isAttorney && !isPhoneVerified(session.user) && !isEmailVerified(session.user);
+
+        if (needsPhoneVerification) {
+          const phoneE164 =
+            tryE164(session.user.new_phone) ||
+            tryE164(session.user.phone) ||
+            tryE164(prof?.phone);
+
+          if (phoneE164) {
+            navigationRef.reset({
+              index: 0,
+              routes: [
+                {
+                  name: 'VerifyAccount',
+                  params: {
+                    phoneE164,
+                    email: session.user.email || '',
+                    role: normalizedRole,
+                    isNewSignup: false,
+                    profilePayload: null,
+                  },
+                },
+              ],
+            });
+            return;
+          }
+        }
+
+        navigationRef.reset({
+          index: 0,
+          routes: [{name: homeRouteForRole(normalizedRole)}],
+        });
+      } catch (err) {
+        console.warn('[LegalLink] AuthSessionBootstrap:', err?.message || err);
+      } finally {
+        if (!cancelled) {
+          onDone?.();
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [navReady, onDone, updateProfile]);
+
+  return null;
+}
+
 function App() {
   const [navReady, setNavReady] = useState(false);
+  const [authBootstrapped, setAuthBootstrapped] = useState(false);
   const linking = useMemo(() => createAppLinking(), []);
+  const handleAuthBootstrapped = useCallback(() => {
+    setAuthBootstrapped(true);
+  }, []);
 
   useEffect(() => {
     SystemUI.setBackgroundColorAsync(NavBase.base).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    // Warm the admin-controlled feature flags cache and keep it in sync.
+    ensureAppConfigLoaded();
+    subscribeToAppConfigChanges();
   }, []);
 
   /** If AsyncStorage has a session from another Supabase project or a dead refresh token, clear it once. */
@@ -112,83 +285,11 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!navReady) {
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      const {
-        data: {session},
-        error: sessionError,
-      } = await supabase.auth.getSession();
-      if (sessionError && isInvalidRefreshTokenError(sessionError)) {
-        await recoverFromInvalidAuthSession();
-        return;
-      }
-      if (cancelled || !session?.user?.id) {
-        return;
-      }
-      if (session.user.phone_confirmed_at) {
-        return;
-      }
-      // Match sign-in logic in authService: email-only verification is enough for clients who confirmed email.
-      if (isEmailVerified(session.user)) {
-        return;
-      }
-
-      const metaRole = String(session.user.user_metadata?.role || '').toLowerCase();
-      if (metaRole === 'attorney') {
-        return;
-      }
-
-      const {data: prof} = await supabase
-        .from('profiles')
-        .select('role, phone')
-        .eq('id', session.user.id)
-        .maybeSingle();
-      const profileRole = String(prof?.role || '').toLowerCase();
-      if (profileRole === 'attorney') {
-        return;
-      }
-
-      const tryE164 = (v) => { if (!v) return null; try { return normalizePhilippinesToE164(String(v)); } catch { return null; } };
-      let phoneE164 = tryE164(session.user.new_phone) || tryE164(session.user.phone);
-      if (!phoneE164) {
-        phoneE164 = tryE164(prof?.phone);
-      }
-
-      if (cancelled || !phoneE164 || !navigationRef.isReady()) {
-        return;
-      }
-
-      const roleForVerify = session.user.user_metadata?.role || prof?.role || 'Client';
-      navigationRef.reset({
-        index: 0,
-        routes: [
-          {
-            name: 'VerifyAccount',
-            params: {
-              phoneE164,
-              email: session.user.email || '',
-              role: roleForVerify,
-              isNewSignup: false,
-              profilePayload: null,
-            },
-          },
-        ],
-      });
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [navReady]);
-
-  useEffect(() => {
-    if (!navReady) {
+    if (!navReady || !authBootstrapped) {
       return;
     }
     flushPendingDeepLink(navigationRef).catch(() => {});
-  }, [navReady]);
+  }, [navReady, authBootstrapped]);
 
   useEffect(() => {
     const {data} = supabase.auth.onAuthStateChange((_event, session) => {
@@ -204,83 +305,112 @@ function App() {
       <SafeAreaProvider style={{flex: 1, backgroundColor: NavBase.base}}>
         <UserProfileProvider>
           <NotificationProvider>
-            <NavigationContainer
-              ref={navigationRef}
-              linking={linking}
-              onReady={() => setNavReady(true)}
-              theme={navigationTheme}>
-              <StatusBar style="light" />
-              {/* Global in-app notification toast — visible on any screen */}
-              <InAppNotificationToast />
-              <Stack.Navigator
-                screenOptions={{
-                  headerShown: false,
-                  animation: 'slide_from_right',
-                  animationDuration: 300,
-                  contentStyle: {backgroundColor: NavBase.base},
-                  freezeOnBlur: false,
-                }}
-                initialRouteName="Landing">
-                <Stack.Screen name="Landing" component={LandingPage} />
-                <Stack.Screen name="LoginSignup" component={LoginAndSignup} />
-                <Stack.Screen name="CreateProfile" component={CreateAccount} />
-                <Stack.Screen name="Login" component={Login} />
-                <Stack.Screen name="VerifyAccount" component={VerifyAccount} />
-                <Stack.Screen name="AccountCreated" component={AccountCreated} />
-                <Stack.Screen name="HomepageClient" component={HomepageClient} />
-                <Stack.Screen name="AttyLandingPage" component={AttyLandingPage} />
-                <Stack.Screen name="AttyMenu" component={AttyMenu} />
-                <Stack.Screen name="ClientMenu" component={ClientMenu} />
-                <Stack.Screen name="ClientNotification" component={ClientNotification} />
-                <Stack.Screen name="ClientSupportMessages" component={ClientSupportMessages} />
-                <Stack.Screen name="BookAppointment" component={BookAppointment} />
-                <Stack.Screen name="ClientNotarial" component={ClientNotarial} />
-                <Stack.Screen name="ProfileSettingsClient" component={ProfileSettingsClient} />
-                <Stack.Screen name="Messages" component={Messages} />
-                <Stack.Screen name="EnterConsultationChat" component={EnterConsultationChat} />
-                <Stack.Screen name="AttorneyProfile" component={AttorneyProfile} />
-                <Stack.Screen name="Chatbot" component={Chatbot} />
-                <Stack.Screen name="MyAppointments" component={MyAppointments} />
-                <Stack.Screen name="TransactionHistory" component={TransactionHistory} />
-                <Stack.Screen name="VerifyIdentity" component={VerifyIdentity} />
-                <Stack.Screen name="ResetPassword" component={ResetPassword} />
-                <Stack.Screen name="BookingRequestSubmitted" component={BookingRequestSubmitted} />
-                <Stack.Screen name="RescheduleAppointment" component={RescheduleAppointment} />
-                <Stack.Screen name="BookingSummary" component={BookingSummary} />
-                <Stack.Screen name="Payment" component={Payment} />
-                <Stack.Screen name="PaymentSuccessful" component={PaymentSuccessful} />
-                <Stack.Screen name="PaymentTranscript" component={PaymentTranscript} />
-                <Stack.Screen name="BookNow" component={BookNow} />
-                <Stack.Screen name="NotarialRequestSubmitted" component={NotarialRequestSubmitted} />
-                <Stack.Screen name="PaymentMethod" component={PaymentMethod} />
-                <Stack.Screen name="UploadIDScreen" component={UploadIDScreen} />
-                <Stack.Screen name="FaceRecognitionScreen" component={FaceRecognitionScreen} />
-                <Stack.Screen name="AttyAvailabilityManager" component={AttyAvailabilityManager} />
-                <Stack.Screen name="AttyConsultationMessage" component={AttyConsultationMessage} />
-                <Stack.Screen name="AttyMyEarnings" component={AttyMyEarnings} />
-                <Stack.Screen name="AttyAnalytics" component={AttyAnalytics} />
-                <Stack.Screen name="AttyPayoutDetails" component={AttyPayoutDetails} />
-                <Stack.Screen name="AttyConfirmPayout" component={AttyConfirmPayout} />
-                <Stack.Screen name="AttySuccessWithdrawal" component={AttySuccessWithdrawal} />
-                <Stack.Screen name="AttyProfileSettings" component={AttyProfileSettings} />
-                <Stack.Screen name="AttyMyAppointments" component={AttyMyAppointments} />
-                <Stack.Screen name="AdminCreateAttorney" component={AdminCreateAttorney} />
-                <Stack.Screen name="ConsultationTranscript" component={ConsultationTranscript} />
-                <Stack.Screen name="ClientConsultationLogs" component={ClientConsultationLogs} />
-                <Stack.Screen name="AttorneyConsultationLogs" component={AttorneyConsultationLogs} />
-                <Stack.Screen name="AttyAnnouncements" component={AttyAnnouncements} />
-                <Stack.Screen
-                  name="ConsultationVideoCall"
-                  component={ConsultationVideoCallScreen}
-                  options={{presentation: 'fullScreenModal', animation: 'fade_from_bottom'}}
+            <View style={{flex: 1, backgroundColor: NavBase.base}}>
+              <NavigationContainer
+                ref={navigationRef}
+                linking={linking}
+                onReady={() => setNavReady(true)}
+                theme={navigationTheme}>
+                <StatusBar style="light" />
+                <AuthSessionBootstrap
+                  navReady={navReady}
+                  onDone={handleAuthBootstrapped}
                 />
-              </Stack.Navigator>
-            </NavigationContainer>
+                {/* Global in-app notification toast — visible on any screen */}
+                <InAppNotificationToast />
+                <ConsultationPeerEntryHost />
+                <Stack.Navigator
+                  screenOptions={{
+                    headerShown: false,
+                    animation: 'slide_from_right',
+                    animationDuration: 300,
+                    contentStyle: {backgroundColor: NavBase.base},
+                    freezeOnBlur: false,
+                  }}
+                  initialRouteName="Landing">
+                  <Stack.Screen name="Landing" component={LandingPage} />
+                  <Stack.Screen name="LoginSignup" component={LoginAndSignup} />
+                  <Stack.Screen name="CreateProfile" component={CreateAccount} />
+                  <Stack.Screen name="Login" component={Login} />
+                  <Stack.Screen name="VerifyAccount" component={VerifyAccount} />
+                  <Stack.Screen name="AccountCreated" component={AccountCreated} />
+                  <Stack.Screen name="HomepageClient" component={HomepageClient} />
+                  <Stack.Screen name="AttyLandingPage" component={AttyLandingPage} />
+                  <Stack.Screen name="AttyMenu" component={AttyMenu} />
+                  <Stack.Screen name="ClientMenu" component={ClientMenu} />
+                  <Stack.Screen name="ClientNotification" component={ClientNotification} />
+                  <Stack.Screen name="ClientAnnouncementDetail" component={ClientAnnouncementDetail} />
+                  <Stack.Screen name="ClientSupportMessages" component={ClientSupportMessages} />
+                  <Stack.Screen name="BookAppointment" component={BookAppointment} />
+                  <Stack.Screen name="ClientNotarial" component={ClientNotarial} />
+                  <Stack.Screen name="ClientNotaryStatus" component={ClientNotaryStatus} />
+                  <Stack.Screen name="ProfileSettingsClient" component={ProfileSettingsClient} />
+                  <Stack.Screen name="Messages" component={Messages} />
+                  <Stack.Screen name="EnterConsultationChat" component={EnterConsultationChat} />
+                  <Stack.Screen name="AttorneyProfile" component={AttorneyProfile} />
+                  <Stack.Screen name="Chatbot" component={Chatbot} />
+                  <Stack.Screen name="MyAppointments" component={MyAppointments} />
+                  <Stack.Screen name="TransactionHistory" component={TransactionHistory} />
+                  <Stack.Screen name="VerifyIdentity" component={VerifyIdentity} />
+                  <Stack.Screen name="ResetPassword" component={ResetPassword} />
+                  <Stack.Screen name="BookingRequestSubmitted" component={BookingRequestSubmitted} />
+                  <Stack.Screen name="RescheduleAppointment" component={RescheduleAppointment} />
+                  <Stack.Screen name="BookingSummary" component={BookingSummary} />
+                  <Stack.Screen name="Payment" component={Payment} />
+                  <Stack.Screen name="PaymentSuccessful" component={PaymentSuccessful} />
+                  <Stack.Screen name="PaymentTranscript" component={PaymentTranscript} />
+                  <Stack.Screen name="BookNow" component={BookNow} />
+                  <Stack.Screen name="NotarialRequestSubmitted" component={NotarialRequestSubmitted} />
+                  <Stack.Screen name="PaymentMethod" component={PaymentMethod} />
+                  <Stack.Screen name="UploadIDScreen" component={UploadIDScreen} />
+                  <Stack.Screen name="FaceRecognitionScreen" component={FaceRecognitionScreen} />
+                  <Stack.Screen
+                    name="DiditWorkflowVerification"
+                    component={DiditWorkflowVerificationScreen}
+                  />
+                  <Stack.Screen name="AttyAvailabilityManager" component={AttyAvailabilityManager} />
+                  <Stack.Screen name="AttyConsultationMessage" component={AttyConsultationMessage} />
+                  <Stack.Screen name="AttyMyEarnings" component={AttyMyEarnings} />
+                  <Stack.Screen name="AttyAnalytics" component={AttyAnalytics} />
+                  <Stack.Screen name="AttyPayoutDetails" component={AttyPayoutDetails} />
+                  <Stack.Screen name="AttyConfirmPayout" component={AttyConfirmPayout} />
+                  <Stack.Screen name="AttySuccessWithdrawal" component={AttySuccessWithdrawal} />
+                  <Stack.Screen name="AttyProfileSettings" component={AttyProfileSettings} />
+                  <Stack.Screen name="AttyMyAppointments" component={AttyMyAppointments} />
+                  <Stack.Screen name="AttyConsultationRequests" component={AttyConsultationRequests} />
+                  <Stack.Screen name="AdminCreateAttorney" component={AdminCreateAttorney} />
+                  <Stack.Screen name="ConsultationTranscript" component={ConsultationTranscript} />
+                  <Stack.Screen name="ClientConsultationLogs" component={ClientConsultationLogs} />
+                  <Stack.Screen name="AttorneyConsultationLogs" component={AttorneyConsultationLogs} />
+                  <Stack.Screen name="AttyAnnouncements" component={AttyAnnouncements} />
+                  <Stack.Screen
+                    name="ConsultationVideoCall"
+                    component={ConsultationVideoCallScreen}
+                    options={{presentation: 'fullScreenModal', animation: 'fade_from_bottom'}}
+                  />
+                </Stack.Navigator>
+              </NavigationContainer>
+              {!authBootstrapped ? (
+                <View style={styles.authSplash} pointerEvents="auto">
+                  <ActivityIndicator size="large" color={NavBase.gold[1]} />
+                </View>
+              ) : null}
+            </View>
           </NotificationProvider>
         </UserProfileProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );
 }
+
+const styles = StyleSheet.create({
+  authSplash: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: NavBase.base,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 100,
+  },
+});
 
 registerRootComponent(App);

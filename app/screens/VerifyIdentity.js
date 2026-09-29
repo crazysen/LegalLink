@@ -241,7 +241,7 @@ export default function VerifyIdentity({navigation, route}) {
             <Text style={styles.backText}>Back</Text>
           </PressScaleButton>
           <View style={styles.brandBadge}>
-            <Text style={styles.brandBadgeText}>Batas Mo</Text>
+            <Text style={styles.brandBadgeText}>LegalLink</Text>
           </View>
         </Animated.View>
 

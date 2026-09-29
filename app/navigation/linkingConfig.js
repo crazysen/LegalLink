@@ -23,10 +23,14 @@ const linkingScreens = {
     },
   },
   ClientNotification: 'client/announcements',
+  ClientAnnouncementDetail: 'client/announcement',
   TransactionHistory: 'client/transaction-history',
   ClientConsultationLogs: 'client/client-logs',
+  ClientNotaryStatus: 'client/client-notary-tracking',
+  ClientNotarial: 'client/notarial-request',
   Chatbot: 'client/chatbot',
   AttyLandingPage: 'attorney/attorney-home',
+  AttyConsultationRequests: 'attorney/consultation-requests',
   AttyMyAppointments: 'attorney/upcoming-appointments',
   AttyAvailabilityManager: 'attorney/manage-availability',
   AttorneyConsultationLogs: 'attorney/attorney-logs',
@@ -55,11 +59,7 @@ async function hasAuthSession() {
 }
 
 function rewritePathForWebParity(path) {
-  let p = String(path || '').replace(/^\/+/, '');
-  if (p === 'attorney/consultation-requests') {
-    return 'attorney/upcoming-appointments';
-  }
-  return p;
+  return String(path || '').replace(/^\/+/, '');
 }
 
 /**
@@ -67,7 +67,7 @@ function rewritePathForWebParity(path) {
  */
 export function createAppLinking() {
   return {
-    prefixes: [Linking.createURL('/'), 'batasmoapp://'],
+    prefixes: [Linking.createURL('/'), 'legallinkapp://'],
     config: linkingConfig,
     getStateFromPath(path, options) {
       const normalized = rewritePathForWebParity(path);

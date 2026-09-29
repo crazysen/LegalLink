@@ -356,7 +356,7 @@ const AnarnaLawScreen = ({navigation}) => {
           <View style={styles.brandBlock}>
             <View style={styles.brandRow}>
               <Image source={require('../assets/images/logo.jpg')} style={styles.brandLogo} />
-              <Text style={styles.brandWordmark}>Batas Mo</Text>
+              <Text style={styles.brandWordmark}>LegalLink</Text>
             </View>
             <Text style={styles.brandSubtitle}>Precision, discretion, and modern counsel.</Text>
           </View>

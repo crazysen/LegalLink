@@ -9,12 +9,11 @@ import {REFERENCE_THEME as T} from '../constants/referenceTheme';
 
 const ICONS = {
   AttyLandingPage: 'view-dashboard-outline',
-  AttyAvailabilityManager: 'calendar-clock',
-  AttyMyAppointments: 'calendar-month',
+  AttyMyAppointments: 'calendar-check-outline',
+  AttyAvailabilityManager: 'calendar-clock-outline',
   AttorneyConsultationLogs: 'text-box-outline',
-  AttyMyEarnings: 'cash',
-  AttyAnalytics: 'chart-bar',
   AttyAnnouncements: 'bullhorn-outline',
+  AttyProfileSettings: 'account-circle-outline',
 };
 
 const AttorneySidebar = ({navigation, route}) => {
@@ -26,11 +25,11 @@ const AttorneySidebar = ({navigation, route}) => {
 
   const menuItems = [
     {id: '1', label: 'Dashboard', route: 'AttyLandingPage'},
-    {id: '2', label: 'My Schedule', route: 'AttyAvailabilityManager'},
-    {id: '3', label: 'Upcoming Appointments', route: 'AttyMyAppointments'},
-    {id: '4', label: 'Logs', route: 'AttorneyConsultationLogs'},
-    {id: '5', label: 'Announcements', route: 'AttyAnnouncements'},
-    {id: '6', label: 'Analytics', route: 'AttyAnalytics'},
+    {id: '2', label: 'Consultation Management', route: 'AttyMyAppointments'},
+    {id: '2b', label: 'My Availability', route: 'AttyAvailabilityManager'},
+    {id: '3', label: 'Logs', route: 'AttorneyConsultationLogs'},
+    {id: '4', label: 'Announcement', route: 'AttyAnnouncements'},
+    {id: '5', label: 'Profile', route: 'AttyProfileSettings'},
   ];
 
   const handleMenuPress = item => {
@@ -38,11 +37,6 @@ const AttorneySidebar = ({navigation, route}) => {
     if (item.route) {
       navigation.navigate(item.route);
     }
-  };
-
-  const handleIdentityPress = () => {
-    Haptics.selectionAsync();
-    navigation.navigate('AttyProfileSettings');
   };
 
   const handleTerminate = async () => {
@@ -73,7 +67,7 @@ const AttorneySidebar = ({navigation, route}) => {
             />
           </View>
           <View style={styles.brandCopy}>
-            <Text style={styles.brandText}>BatasMo</Text>
+            <Text style={styles.brandText}>LegalLink</Text>
             <Text style={styles.brandSub}>Attorney Console</Text>
           </View>
         </View>
@@ -118,13 +112,6 @@ const AttorneySidebar = ({navigation, route}) => {
         </View>
 
         <View style={styles.divider} />
-
-        <TouchableOpacity style={styles.navItemWrapper} onPress={handleIdentityPress} activeOpacity={0.88}>
-          <View style={styles.inactiveItem}>
-            <MaterialCommunityIcons name="account-cog-outline" size={22} color={T.textMuted} />
-            <Text style={styles.navText}>Profile Settings</Text>
-          </View>
-        </TouchableOpacity>
 
         <TouchableOpacity style={styles.terminateBtn} onPress={handleTerminate} activeOpacity={0.88}>
           <MaterialCommunityIcons name="logout" size={22} color="#FF5252" />

@@ -1,4 +1,4 @@
-import React, {useCallback, useMemo, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {useFocusEffect} from '@react-navigation/native';
 import {
   ActivityIndicator,
@@ -51,9 +51,12 @@ function formatDateTime(isoDateTime) {
   };
 }
 
-export default function ClientConsultationLogs({navigation}) {
+export default function ClientConsultationLogs({navigation, route}) {
+  const initialAppointmentId = String(route?.params?.appointmentId || '').trim();
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
+  const autoOpenedRef = useRef(false);
+  const [retryTick, setRetryTick] = useState(0);
 
   const load = useCallback(async () => {
     try {
@@ -79,6 +82,45 @@ export default function ClientConsultationLogs({navigation}) {
       load();
     }, [load]),
   );
+
+  useEffect(() => {
+    autoOpenedRef.current = false;
+  }, [initialAppointmentId]);
+
+  useEffect(() => {
+    if (!initialAppointmentId || autoOpenedRef.current) return undefined;
+
+    const match = items.find(row => String(row.id) === initialAppointmentId);
+    if (match) {
+      autoOpenedRef.current = true;
+      const attorneyName = match.attorney_name ?? 'Attorney';
+      navigation.navigate('ConsultationTranscript', {
+        appointmentId: match.id,
+        title: match.title ?? 'Consultation',
+        logTitle: match.title ?? '',
+        initials: String(attorneyName)
+          .split(' ')
+          .filter(Boolean)
+          .slice(0, 2)
+          .map(p => p[0]?.toUpperCase())
+          .join('')
+          .slice(0, 2) || '?',
+        summaryFocus: true,
+      });
+      return undefined;
+    }
+
+    let attempts = 0;
+    const intervalId = setInterval(() => {
+      attempts += 1;
+      setRetryTick(v => v + 1);
+      if (attempts >= 6 || autoOpenedRef.current) {
+        clearInterval(intervalId);
+      }
+    }, 2000);
+
+    return () => clearInterval(intervalId);
+  }, [initialAppointmentId, items, navigation, retryTick]);
 
   const initialsFor = useMemo(
     () => name =>
@@ -139,12 +181,14 @@ export default function ClientConsultationLogs({navigation}) {
                         onPress={() =>
                           navigation.navigate('ConsultationTranscript', {
                             appointmentId: item.id,
-                            title: attorneyName,
+                            title: item.title ?? 'Consultation',
+                            logTitle: item.title ?? '',
                             initials: initialsFor(attorneyName),
+                            summaryFocus: true,
                           })
                         }>
                         <LinearGradient colors={[T.gold[0], T.gold[1]]} style={styles.transcriptBtn}>
-                          <Text style={styles.transcriptBtnText}>View Transcript</Text>
+                          <Text style={styles.transcriptBtnText}>View summary</Text>
                         </LinearGradient>
                       </TouchableOpacity>
                     </View>

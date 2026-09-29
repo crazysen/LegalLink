@@ -80,7 +80,7 @@ export default function ClientSupportMessages({navigation, route}) {
         if (cancelled) return;
         setClientId(profile?.id || null);
         if (!profile?.id) {
-          setLoadError('Sign in to message BatasMo Admin.');
+          setLoadError('Sign in to message LegalLink Admin.');
         }
       } finally {
         if (!cancelled) setBootLoading(false);
@@ -192,7 +192,7 @@ export default function ClientSupportMessages({navigation, route}) {
               onPress={() => (navigation.canGoBack() ? navigation.goBack() : navigation.navigate('HomepageClient'))}
             />
             <Text style={styles.screenTitle}>Messages</Text>
-            <Text style={styles.screenSubtitle}>Message BatasMo Admin for help or follow-ups.</Text>
+            <Text style={styles.screenSubtitle}>Message LegalLink Admin for help or follow-ups.</Text>
           </View>
 
           <View style={styles.card}>
@@ -202,11 +202,11 @@ export default function ClientSupportMessages({navigation, route}) {
                   source={require('../assets/images/logo.jpg')}
                   style={styles.headAvatarImage}
                   resizeMode="cover"
-                  accessibilityLabel="BatasMo Admin"
+                  accessibilityLabel="LegalLink Admin"
                 />
               </View>
               <View style={styles.headTextCol}>
-                <Text style={styles.headTitle}>BatasMo Admin</Text>
+                <Text style={styles.headTitle}>LegalLink Admin</Text>
                 <Text style={styles.headSub}>
                   Reach out for booking help, payment concerns, or any follow-ups.
                 </Text>
@@ -230,7 +230,7 @@ export default function ClientSupportMessages({navigation, route}) {
                 <View style={styles.empty}>
                   <Text style={styles.emptyTitle}>Start a conversation</Text>
                   <Text style={styles.emptyBody}>
-                    Send a message to BatasMo Admin and we&apos;ll get back to you here.
+                    Send a message to LegalLink Admin and we&apos;ll get back to you here.
                   </Text>
                 </View>
               }
@@ -242,7 +242,7 @@ export default function ClientSupportMessages({navigation, route}) {
                 style={styles.input}
                 value={draft}
                 onChangeText={setDraft}
-                placeholder="Type your message to BatasMo Admin..."
+                placeholder="Type your message to LegalLink Admin..."
                 placeholderTextColor="rgba(21, 34, 56, 0.45)"
                 editable={!sending && Boolean(clientId)}
                 maxLength={2000}

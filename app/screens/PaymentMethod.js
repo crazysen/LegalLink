@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { warmPaymentBackend } from '../services/paymentApiClient';
 import {
   StyleSheet,
   View,
@@ -8,18 +9,26 @@ import {
   Image,
 } from 'react-native';
 import { REFERENCE_THEME as T } from '../constants/referenceTheme';
+import { DEFAULT_PAYMENT_METHOD } from '../constants/paymentConfig';
 import { ClientScreenShell, ClientFadeIn } from '../components/ClientScreenShell';
 import ClientChevronBack from '../components/ClientChevronBack';
 
 export default function PaymentMethod({navigation, route}) {
-  const [selectedMethod, setSelectedMethod] = useState(null);
+  const [selectedMethod, setSelectedMethod] = useState(DEFAULT_PAYMENT_METHOD);
   const serviceData = route?.params?.serviceData || { type: 'Consultation', amount: '₱2,500' };
   const paymentContext = route?.params?.paymentContext || null;
 
+  useEffect(() => {
+    warmPaymentBackend().catch(() => {});
+  }, []);
+
   const paymentMethods = [
-    { id: 'gcash', name: 'GCash', icon: require('../assets/images/Gcash_logo.png'), description: 'Mobile wallet payment' },
-    { id: 'maya', name: 'Maya', icon: require('../assets/images/Maya_logo.png'), description: 'Maya e-wallet payment' },
-    { id: 'qrph', name: 'QR Ph', icon: require('../assets/images/QR_Ph_Logo.png'), description: 'QR Ph scan to pay' },
+    {
+      id: DEFAULT_PAYMENT_METHOD,
+      name: 'QR Ph',
+      icon: require('../assets/images/QR_Ph_Logo.png'),
+      description: 'Scan QR Ph to pay',
+    },
   ];
 
   const handleContinue = () => {
@@ -43,7 +52,7 @@ export default function PaymentMethod({navigation, route}) {
         <View style={styles.header}>
           <ClientChevronBack style={styles.backHit} onPress={handleCancel} />
           <Text style={styles.headerTitle}>Choose Payment Method</Text>
-          <Text style={styles.headerSubtitle}>Select how you want to pay</Text>
+          <Text style={styles.headerSubtitle}>Pay with QR Ph</Text>
         </View>
 
         <View style={styles.amountBox}>

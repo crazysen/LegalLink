@@ -6,10 +6,15 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import {useNavigation} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {Ionicons} from '@expo/vector-icons';
 import {useNotifications} from '../context/NotificationContext';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
+import {
+  isAdminAnnouncementNotification,
+  openAnnouncementDetail,
+} from '../services/announcementImages';
 
 /**
  * Global in-app toast banner that slides down from the top whenever a new
@@ -17,6 +22,7 @@ import {REFERENCE_THEME as T} from '../constants/referenceTheme';
  */
 export default function InAppNotificationToast() {
   const {toast, dismissToast} = useNotifications();
+  const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const translateY = useRef(new Animated.Value(-120)).current;
   const opacity = useRef(new Animated.Value(0)).current;
@@ -56,6 +62,15 @@ export default function InAppNotificationToast() {
 
   if (!toast) return null;
 
+  const handlePress = () => {
+    if (isAdminAnnouncementNotification(toast.type)) {
+      openAnnouncementDetail(navigation, toast);
+    } else {
+      navigation.navigate('ClientNotification');
+    }
+    dismissToast();
+  };
+
   return (
     <Animated.View
       style={[
@@ -69,7 +84,7 @@ export default function InAppNotificationToast() {
       <TouchableOpacity
         activeOpacity={0.92}
         style={styles.inner}
-        onPress={dismissToast}>
+        onPress={handlePress}>
         <View style={styles.iconWrap}>
           <Ionicons name="notifications" size={20} color={T.gold[1]} />
         </View>

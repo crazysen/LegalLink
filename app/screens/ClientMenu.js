@@ -34,9 +34,8 @@ const ROUTE_ICONS = {
   HomepageClient: 'view-dashboard',
   BookAppointment: 'calendar-check',
   ClientSupportMessages: 'message-text',
-  MyAppointments: 'folder-account',
   ClientConsultationLogs: 'text-box-outline',
-  ClientNotarial: 'file-certificate',
+  ClientNotaryStatus: 'file-document-outline',
   ClientNotification: 'bullhorn',
   TransactionHistory: 'history',
   ProfileSettingsClient: 'account-circle',
@@ -118,10 +117,9 @@ export default function ClientMenu({navigation, route}) {
     }, [refreshSupportUnread]),
   );
 
-  const go = r => {
-    if (r) {
-      navigation.navigate(r);
-    }
+  const go = routeName => {
+    if (!routeName) return;
+    navigation.replace(routeName);
   };
 
   const handleClose = () => {
@@ -170,7 +168,7 @@ export default function ClientMenu({navigation, route}) {
                     style={styles.brandLogo}
                     resizeMode="cover"
                   />
-                  <Text style={styles.brandText}>BatasMo</Text>
+                  <Text style={styles.brandText}>LegalLink</Text>
                 </View>
                 <TouchableOpacity onPress={handleClose} hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}>
                   <Feather name="chevron-left" size={24} color={T.gold[0]} />

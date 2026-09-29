@@ -9,7 +9,10 @@ import {
   Alert,
   ActivityIndicator,
   Keyboard,
+  Modal,
+  ScrollView,
 } from 'react-native';
+import {useFocusEffect} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {MaterialCommunityIcons} from '@expo/vector-icons';
 import {ClientScreenShell} from '../components/ClientScreenShell';
@@ -24,7 +27,21 @@ import {
   attachThreadRealtime,
   getThreadMessages,
 } from '../services/chatService';
-import {closeConsultationRoom} from '../services/messageService';
+import {
+  CHAT_DOCUMENT_PICKER_TYPES,
+  isBlockedChatAttachment,
+} from '../services/chatTypes';
+import {
+  endConsultationSession,
+  notifyClientConsultationTimeWarning,
+  saveAttorneyConsultationBranch,
+  saveAttorneyConsultationSummary,
+} from '../services/messageService';
+import {
+  attachConsultationChatPresence,
+  dismissConsultationPeerEntry,
+} from '../services/consultationChatPresence';
+import ConsultationWaitingPopup from '../components/ConsultationWaitingPopup';
 import {getAppointmentConsultationMeta} from '../services/appointmentService';
 import {
   getConsultationSessionBounds,
@@ -35,7 +52,21 @@ import {
   cancelConsultationSessionNotifications,
 } from '../services/consultationSessionNotifications';
 import {ConsultationSessionAlerts} from '../components/ConsultationSessionBar';
-import {getOrCreateVideoMeeting} from '../services/videoMeetingService';
+import {
+  getOrCreateVideoMeeting,
+  getVideoSdkToken,
+} from '../services/videoMeetingService';
+import {
+  getConsultationBranchesForAttorney,
+  parseConsultationBranchFromTitle,
+} from '../services/consultationBranches';
+import {
+  CONSULTATION_SUMMARY_SECTIONS,
+  serializeConsultationSummary,
+  consultationSummaryHasContent,
+} from '../services/consultationSummaryFormat';
+import {getCurrentSessionProfile} from '../services/userApi';
+import {supabase} from '../services/supabaseClient';
 
 const ArrowLeft = props => <MaterialCommunityIcons name="arrow-left" {...props} />;
 const Paperclip = props => <MaterialCommunityIcons name="paperclip" {...props} />;
@@ -68,12 +99,28 @@ export default function ConsultationChat({navigation, route}) {
   const [isClosed, setIsClosed] = useState(false);
   const [sending, setSending] = useState(false);
   const [videoBusy, setVideoBusy] = useState(false);
+  const [incomingMeetingId, setIncomingMeetingId] = useState(null);
   const [keyboardInset, setKeyboardInset] = useState(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [sessionBounds, setSessionBounds] = useState(null);
+  const [waitingPopup, setWaitingPopup] = useState(null);
+  const [localParticipantName, setLocalParticipantName] = useState('Attorney');
+  const [summaryModalVisible, setSummaryModalVisible] = useState(false);
+  const [branchPickerVisible, setBranchPickerVisible] = useState(false);
+  const [branchOptions, setBranchOptions] = useState([]);
+  const [branchListLoaded, setBranchListLoaded] = useState(false);
+  const [selectedBranch, setSelectedBranch] = useState('');
+  const [summaryFields, setSummaryFields] = useState(() =>
+    Object.fromEntries(CONSULTATION_SUMMARY_SECTIONS.map(s => [s.key, ''])),
+  );
+  const [summarySaving, setSummarySaving] = useState(false);
+  const tenMinuteWarningSentRef = useRef(false);
   const listRef = useRef(null);
   const notifIdsRef = useRef([]);
   const prevTimerPhaseRef = useRef(null);
+  const isFocusedRef = useRef(false);
+  const startedMeetingIdRef = useRef(null);
+  const autoOpenedMeetingIdRef = useRef(null);
   const clientName = route?.params?.clientName || 'Sarah Jenkins';
   const clientInitials = route?.params?.clientInitials || 'SJ';
   const threadId = useMemo(
@@ -81,11 +128,86 @@ export default function ConsultationChat({navigation, route}) {
     [route?.params?.chatId, route?.params?.clientName],
   );
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const {profile} = await getCurrentSessionProfile();
+        if (cancelled) return;
+        const name = String(profile?.full_name || profile?.name || profile?.email || '').trim();
+        if (name) setLocalParticipantName(name);
+      } catch {
+        /* keep default */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!summaryModalVisible) return;
+    let cancelled = false;
+    (async () => {
+      setBranchListLoaded(false);
+      try {
+        const {profile} = await getCurrentSessionProfile();
+        let specialties = [];
+        if (profile?.id) {
+          const {data: atty} = await supabase
+            .from('attorney_profiles')
+            .select('specialties')
+            .eq('user_id', profile.id)
+            .maybeSingle();
+          const raw = atty?.specialties;
+          specialties = Array.isArray(raw) ? raw : raw ? [String(raw)] : [];
+        }
+        const opts = getConsultationBranchesForAttorney({
+          name: profile?.full_name,
+          specialties,
+        });
+        if (!cancelled) setBranchOptions(Array.isArray(opts) ? opts : []);
+      } catch {
+        if (!cancelled) setBranchOptions([]);
+      } finally {
+        if (!cancelled) setBranchListLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [summaryModalVisible]);
+
+  useEffect(() => {
+    if (!summaryModalVisible || !threadId || branchOptions.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      const {data} = await supabase
+        .from('appointments')
+        .select('title')
+        .eq('id', threadId)
+        .maybeSingle();
+      if (cancelled) return;
+      const parsed = parseConsultationBranchFromTitle(data?.title || '');
+      if (parsed && branchOptions.includes(parsed)) {
+        setSelectedBranch(parsed);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [summaryModalVisible, threadId, branchOptions]);
+
   const loadThread = useCallback(async () => {
     try {
-      const {messages: rows, isClosed: closed} = await getThreadMessages(threadId);
+      const {messages: rows, isClosed: closed, videoMeetingId} = await getThreadMessages(threadId);
       setMessages(rows);
       setIsClosed(closed);
+      setIncomingMeetingId(prev => {
+        const next = videoMeetingId || null;
+        if (next && next === startedMeetingIdRef.current) return prev;
+        return next;
+      });
     } catch {
       setMessages([]);
       setIsClosed(false);
@@ -159,10 +281,42 @@ export default function ConsultationChat({navigation, route}) {
   }, []);
 
   useEffect(() => {
+    if (!threadId || threadId === 'general-chat') return undefined;
+    let cancelled = false;
+    let detachPresence = () => {};
+
+    (async () => {
+      const {profile} = await getCurrentSessionProfile();
+      if (cancelled || !profile?.id) return;
+      detachPresence = attachConsultationChatPresence({
+        appointmentId: threadId,
+        role: 'attorney',
+        userId: profile.id,
+        displayName: profile.full_name || 'Attorney',
+        otherPartyName: clientName,
+        onWaitingPopup: copy => setWaitingPopup(copy),
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+      detachPresence();
+    };
+  }, [threadId, clientName]);
+
+  useEffect(() => {
     if (!sessionBounds || isClosed) {
+      tenMinuteWarningSentRef.current = false;
       return;
     }
     const {phase} = getConsultationTimerDisplay(nowMs, sessionBounds);
+    if (phase === 'warning' && !tenMinuteWarningSentRef.current) {
+      tenMinuteWarningSentRef.current = true;
+      notifyClientConsultationTimeWarning(threadId).catch(() => {});
+    }
+    if (phase !== 'warning') {
+      tenMinuteWarningSentRef.current = false;
+    }
     const prev = prevTimerPhaseRef.current;
     if (prev !== 'in_grace' && phase === 'in_grace') {
       Alert.alert(
@@ -183,7 +337,20 @@ export default function ConsultationChat({navigation, route}) {
     let cancelled = false;
     (async () => {
       try {
-        const unsub = await attachThreadRealtime(threadId, setMessages, setIsClosed);
+        const unsub = await attachThreadRealtime(
+          threadId,
+          setMessages,
+          setIsClosed,
+          {
+            onVideoMeetingChange: meetingId => {
+              setIncomingMeetingId(prev => {
+                const next = meetingId || null;
+                if (next && next === startedMeetingIdRef.current) return prev;
+                return next;
+              });
+            },
+          },
+        );
         if (!cancelled) {
           unsubscribe = unsub;
         }
@@ -196,6 +363,15 @@ export default function ConsultationChat({navigation, route}) {
       unsubscribe();
     };
   }, [threadId]);
+
+  useFocusEffect(
+    useCallback(() => {
+      isFocusedRef.current = true;
+      return () => {
+        isFocusedRef.current = false;
+      };
+    }, []),
+  );
 
   useEffect(() => {
     listRef.current?.scrollToEnd({animated: true});
@@ -227,17 +403,52 @@ export default function ConsultationChat({navigation, route}) {
     try {
       setVideoBusy(true);
       const {meetingId, roomId, token} = await getOrCreateVideoMeeting(threadId);
+      startedMeetingIdRef.current = meetingId;
+      autoOpenedMeetingIdRef.current = meetingId;
+      setIncomingMeetingId(null);
       navigation.navigate('ConsultationVideoCall', {
         meetingId,
         token,
         consultationRoomId: roomId,
-        participantName: clientName || 'Attorney',
+        participantName: localParticipantName,
+        remoteParticipantName: clientName || 'Client',
       });
     } catch (e) {
       Alert.alert('Video call', e?.message ?? 'Could not start video.');
     } finally {
       setVideoBusy(false);
     }
+  };
+
+  const joinIncomingVideoCall = useCallback(
+    async meetingId => {
+      if (!threadId || !meetingId || isClosed) return;
+      if (videoBusy) return;
+      try {
+        setVideoBusy(true);
+        const {roomId} = await getOrCreateVideoMeeting(threadId);
+        const token = await getVideoSdkToken();
+        autoOpenedMeetingIdRef.current = meetingId;
+        navigation.navigate('ConsultationVideoCall', {
+          meetingId,
+          token,
+          consultationRoomId: roomId,
+          participantName: localParticipantName,
+          remoteParticipantName: clientName || 'Client',
+        });
+      } catch (e) {
+        Alert.alert('Video call', e?.message ?? 'Could not join video.');
+      } finally {
+        setVideoBusy(false);
+      }
+    },
+    [clientName, isClosed, localParticipantName, navigation, threadId, videoBusy],
+  );
+
+  const handleDismissIncomingCall = () => {
+    const meetingId = incomingMeetingId;
+    setIncomingMeetingId(null);
+    autoOpenedMeetingIdRef.current = meetingId;
   };
 
   const handleEndConsultation = () => {
@@ -253,11 +464,16 @@ export default function ConsultationChat({navigation, route}) {
             try {
               await cancelConsultationSessionNotifications(notifIdsRef.current);
               notifIdsRef.current = [];
-              await closeConsultationRoom(threadId);
+              await endConsultationSession(threadId);
               setIsClosed(true);
               const next = await getThreadMessages(threadId);
               setMessages(next.messages);
               setIsClosed(next.isClosed);
+              setSummaryFields(
+                Object.fromEntries(CONSULTATION_SUMMARY_SECTIONS.map(s => [s.key, ''])),
+              );
+              setSelectedBranch('');
+              setSummaryModalVisible(true);
             } catch (e) {
               Alert.alert('Error', e?.message ?? 'Could not end consultation.');
             }
@@ -339,7 +555,7 @@ export default function ConsultationChat({navigation, route}) {
     }
     const result = await DocumentPicker.getDocumentAsync({
       copyToCacheDirectory: true,
-      type: '*/*',
+      type: CHAT_DOCUMENT_PICKER_TYPES,
     });
     if (result.canceled) {
       return;
@@ -357,12 +573,21 @@ export default function ConsultationChat({navigation, route}) {
     if (!asset?.uri) {
       return;
     }
+    const fileName = asset.name || 'file';
+    const mime = asset.mimeType || 'application/octet-stream';
+    if (isBlockedChatAttachment(mime, fileName)) {
+      Alert.alert(
+        'Not allowed',
+        'Videos cannot be sent in chat. Choose an image or a document (PDF, DOC, TXT).',
+      );
+      return;
+    }
     try {
       setSending(true);
       const {messages: next, isClosed: closed} = await appendThreadAttachment(threadId, {
         uri: asset.uri,
-        fileName: asset.name || 'file',
-        mime: asset.mimeType || 'application/octet-stream',
+        fileName,
+        mime,
         size: asset.size ?? 0,
         caption: message.trim() || undefined,
       });
@@ -373,6 +598,29 @@ export default function ConsultationChat({navigation, route}) {
       Alert.alert('Error', e?.message ?? 'Upload failed.');
     } finally {
       setSending(false);
+    }
+  };
+
+  const handleSaveSessionSummary = async () => {
+    const trimmedBranch = selectedBranch.trim();
+    if (!trimmedBranch) {
+      Alert.alert('Branch required', 'Select the consultation branch that best fits this session.');
+      return;
+    }
+    if (!consultationSummaryHasContent(summaryFields)) {
+      Alert.alert('Summary required', 'Please fill in at least one of the summary sections.');
+      return;
+    }
+    try {
+      setSummarySaving(true);
+      await saveAttorneyConsultationBranch({appointmentId: threadId, branch: trimmedBranch});
+      await saveAttorneyConsultationSummary(threadId, serializeConsultationSummary(summaryFields));
+      setSummaryModalVisible(false);
+      Alert.alert('Saved', 'Session summary saved successfully.');
+    } catch (e) {
+      Alert.alert('Error', e?.message ?? 'Could not save summary.');
+    } finally {
+      setSummarySaving(false);
     }
   };
 
@@ -441,6 +689,34 @@ export default function ConsultationChat({navigation, route}) {
                   nowMs={nowMs}
                   isClosed={isClosed}
                 />
+                {!isClosed && incomingMeetingId ? (
+                  <View style={styles.incomingCallCard}>
+                    <View style={styles.incomingCallTextWrap}>
+                      <Text style={styles.incomingCallTitle}>Active video call</Text>
+                      <Text style={styles.incomingCallSubtitle}>
+                        A video meeting is in progress. Tap Join to enter the call.
+                      </Text>
+                    </View>
+                    <View style={styles.incomingCallActions}>
+                      <TouchableOpacity
+                        style={styles.incomingCallJoinBtn}
+                        onPress={() => joinIncomingVideoCall(incomingMeetingId)}
+                        disabled={videoBusy}
+                        activeOpacity={0.85}>
+                        {videoBusy ? (
+                          <ActivityIndicator size="small" color="#fff" />
+                        ) : (
+                          <Text style={styles.incomingCallJoinText}>Join</Text>
+                        )}
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.incomingCallDismissBtn}
+                        onPress={handleDismissIncomingCall}>
+                        <Text style={styles.incomingCallDismissText}>Dismiss</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                ) : null}
                 {isClosed && (
                   <View style={styles.closedBanner}>
                     <Text style={styles.closedBannerText}>
@@ -491,6 +767,131 @@ export default function ConsultationChat({navigation, route}) {
             </View>
           </View>
         </View>
+
+      <Modal
+        visible={summaryModalVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={() => !summarySaving && setSummaryModalVisible(false)}>
+        <View style={styles.summaryOverlay}>
+          <View style={styles.summarySheet}>
+            <Text style={styles.summaryModalTitle}>Session summary</Text>
+            <Text style={styles.summaryModalSubtitle}>
+              Tag this consultation and capture what you discussed with the client.
+            </Text>
+
+            <Text style={styles.summaryFieldLabel}>Consultation branch</Text>
+            <TouchableOpacity
+              style={styles.branchField}
+              onPress={() => branchOptions.length > 0 && setBranchPickerVisible(true)}
+              disabled={branchOptions.length === 0}>
+              <Text
+                style={
+                  selectedBranch ? styles.branchFieldText : styles.branchFieldPlaceholder
+                }
+                numberOfLines={2}>
+                {selectedBranch ||
+                  (!branchListLoaded
+                    ? 'Loading branches…'
+                    : branchOptions.length > 0
+                      ? 'Tap to select branch'
+                      : 'No branches mapped for your profile')}
+              </Text>
+              <MaterialCommunityIcons name="chevron-down" size={22} color={T.textSoft} />
+            </TouchableOpacity>
+
+            <ScrollView
+              style={styles.summaryScroll}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}>
+              {CONSULTATION_SUMMARY_SECTIONS.map(section => (
+                <View key={section.key} style={styles.summaryBlock}>
+                  <Text style={styles.summarySectionTitle}>{section.title}</Text>
+                  <Text style={styles.summarySectionSub}>{section.subtitle}</Text>
+                  <TextInput
+                    style={styles.summaryInput}
+                    placeholder={section.placeholder}
+                    placeholderTextColor={T.textSoft}
+                    multiline
+                    value={summaryFields[section.key]}
+                    onChangeText={t =>
+                      setSummaryFields(prev => ({...prev, [section.key]: t}))
+                    }
+                  />
+                </View>
+              ))}
+            </ScrollView>
+
+            <View style={styles.summaryActions}>
+              <TouchableOpacity
+                style={styles.summaryBtnGhost}
+                disabled={summarySaving}
+                onPress={() => setSummaryModalVisible(false)}>
+                <Text style={styles.summaryBtnGhostText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.summaryBtnGold, summarySaving && styles.summaryBtnDisabled]}
+                disabled={summarySaving}
+                onPress={handleSaveSessionSummary}>
+                {summarySaving ? (
+                  <ActivityIndicator color={T.base} />
+                ) : (
+                  <Text style={styles.summaryBtnGoldText}>Save</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={branchPickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setBranchPickerVisible(false)}>
+        <View style={styles.pickerModalRoot}>
+          <TouchableOpacity
+            style={styles.pickerOverlay}
+            activeOpacity={1}
+            onPress={() => setBranchPickerVisible(false)}
+          />
+          <View style={styles.pickerSheet}>
+            <Text style={styles.pickerTitle}>Consultation branch</Text>
+            <FlatList
+              data={branchOptions}
+              keyExtractor={item => item}
+              keyboardShouldPersistTaps="handled"
+              renderItem={({item}) => (
+                <TouchableOpacity
+                  style={styles.pickerRow}
+                  onPress={() => {
+                    setSelectedBranch(item);
+                    setBranchPickerVisible(false);
+                  }}>
+                  <Text style={styles.pickerRowText}>{item}</Text>
+                </TouchableOpacity>
+              )}
+            />
+          </View>
+        </View>
+      </Modal>
+      <ConsultationWaitingPopup
+        visible={Boolean(waitingPopup)}
+        title={waitingPopup?.title}
+        body={waitingPopup?.body}
+        showGoToChatroom
+        goToChatroomLabel="Continue in Chatroom"
+        onNotNow={() => {
+          if (waitingPopup?.appointmentId) {
+            dismissConsultationPeerEntry(
+              waitingPopup.appointmentId,
+              waitingPopup.otherJoinedAt,
+            );
+          }
+          setWaitingPopup(null);
+        }}
+        onGoToChatroom={() => setWaitingPopup(null)}
+      />
     </ClientScreenShell>
   );
 }
@@ -547,6 +948,33 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     fontWeight: '700',
   },
+  incomingCallCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(37, 99, 235, 0.18)',
+    borderColor: 'rgba(96, 165, 250, 0.55)',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 16,
+    gap: 12,
+  },
+  incomingCallTextWrap: {flex: 1, minWidth: 0},
+  incomingCallTitle: {color: T.text, fontWeight: '800', fontSize: 13},
+  incomingCallSubtitle: {color: T.textSoft, fontSize: 11, marginTop: 2},
+  incomingCallActions: {flexDirection: 'row', alignItems: 'center', gap: 6},
+  incomingCallJoinBtn: {
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 18,
+    minWidth: 56,
+    alignItems: 'center',
+  },
+  incomingCallJoinText: {color: '#fff', fontWeight: '800', fontSize: 12},
+  incomingCallDismissBtn: {paddingHorizontal: 8, paddingVertical: 6},
+  incomingCallDismissText: {color: T.textSoft, fontWeight: '700', fontSize: 11},
   clientBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -667,5 +1095,124 @@ const styles = StyleSheet.create({
   sendBtnDisabled: {
     backgroundColor: 'rgba(148, 163, 184, 0.5)',
   },
+  summaryOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(4, 7, 11, 0.72)',
+    justifyContent: 'flex-end',
+  },
+  summarySheet: {
+    backgroundColor: 'rgba(18, 26, 36, 0.98)',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 20,
+    paddingTop: 20,
+    paddingBottom: 28,
+    maxHeight: '92%',
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.18)',
+  },
+  summaryModalTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: T.text,
+  },
+  summaryModalSubtitle: {
+    marginTop: 6,
+    marginBottom: 16,
+    fontSize: 13,
+    color: T.textSoft,
+    lineHeight: 18,
+  },
+  summaryFieldLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: T.textSoft,
+    marginBottom: 8,
+  },
+  branchField: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.2)',
+    backgroundColor: 'rgba(4, 7, 11, 0.45)',
+    marginBottom: 16,
+    gap: 8,
+  },
+  branchFieldText: {flex: 1, color: T.text, fontWeight: '600', fontSize: 14},
+  branchFieldPlaceholder: {flex: 1, color: T.textSoft, fontSize: 14},
+  summaryScroll: {maxHeight: 420},
+  summaryBlock: {marginBottom: 14},
+  summarySectionTitle: {fontSize: 15, fontWeight: '800', color: T.gold[0]},
+  summarySectionSub: {fontSize: 11, color: T.textSoft, marginTop: 2, marginBottom: 8},
+  summaryInput: {
+    minHeight: 72,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.15)',
+    borderRadius: 12,
+    padding: 12,
+    fontSize: 14,
+    color: T.text,
+    textAlignVertical: 'top',
+    backgroundColor: 'rgba(4, 7, 11, 0.35)',
+  },
+  summaryActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+    marginTop: 12,
+    gap: 12,
+  },
+  summaryBtnGhost: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+  },
+  summaryBtnGhostText: {color: T.textSoft, fontWeight: '700', fontSize: 15},
+  summaryBtnGold: {
+    backgroundColor: T.gold[1],
+    paddingVertical: 12,
+    paddingHorizontal: 28,
+    borderRadius: 24,
+    minWidth: 110,
+    alignItems: 'center',
+  },
+  summaryBtnGoldText: {color: T.base, fontWeight: '800', fontSize: 15},
+  summaryBtnDisabled: {opacity: 0.55},
+  pickerModalRoot: {
+    flex: 1,
+    justifyContent: 'flex-end',
+  },
+  pickerOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(4, 7, 11, 0.55)',
+  },
+  pickerSheet: {
+    maxHeight: '55%',
+    marginHorizontal: 16,
+    marginBottom: 24,
+    backgroundColor: 'rgba(18, 26, 36, 0.98)',
+    borderRadius: 16,
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.2)',
+  },
+  pickerTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: T.text,
+    paddingHorizontal: 16,
+    paddingBottom: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(244, 215, 139, 0.12)',
+  },
+  pickerRow: {
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
+  },
+  pickerRowText: {color: T.text, fontSize: 14},
   backButton: {padding: 4},
 });

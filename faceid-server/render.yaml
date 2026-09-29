@@ -1,0 +1,20 @@
+# Deploy from GitHub: Render Dashboard → New → Blueprint → connect repo
+# Or: New Web Service → Root Directory = Mobile/faceid-server
+
+services:
+  - type: web
+    name: batasmo-didit-proxy
+    runtime: node
+    rootDir: Mobile/faceid-server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /didit/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DIDIT_API_KEY
+        sync: false
+      - key: DIDIT_WORKFLOW_ID
+        sync: false
+      - key: DIDIT_CALLBACK_URL
+        value: batasmoapp://didit-callback

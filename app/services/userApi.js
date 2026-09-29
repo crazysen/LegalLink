@@ -1,3 +1,4 @@
+import { readAsStringAsync } from 'expo-file-system/legacy';
 import { supabase } from './supabaseClient';
 import { signOutCurrentUser } from './authService';
 import {
@@ -5,13 +6,47 @@ import {
   getMemoryProfileCache,
   setMemoryProfileCache,
 } from './profileSessionMemory';
+import {
+  getConsultationBranchesForAttorney,
+  parseConsultationBranchFromTitle,
+} from './consultationBranches';
+import { requestPaymentApi } from './paymentApiClient';
+import { getBundledAttorneyPhotoUri } from '../constants/attorneyPhotos';
+import { resolveNotarialAmount } from '../constants/notarialFees';
+import { parseNotificationImageUrl } from './announcementImages';
+import {
+  formatHourLabel,
+  sortAvailabilitySlotsChronologically,
+  toDateKey,
+  getTodayDateKey,
+} from './availabilityScheduleUtils';
 
 export const signOutUser = () => signOutCurrentUser();
 
 const DASHBOARD_CACHE_TTL_MS = 15000
+const ATTORNEY_PROFILE_CACHE_TTL_MS = 120000
 
 const clientHomeCache = new Map()
 const attorneyHomeCache = new Map()
+const attorneyProfileCache = new Map()
+
+export function getCachedAttorneyProfile(userId) {
+  if (!userId) return null
+  const entry = attorneyProfileCache.get(userId)
+  if (!entry) return null
+  if (Date.now() - entry.updatedAt > ATTORNEY_PROFILE_CACHE_TTL_MS) return null
+  return entry.value
+}
+
+export function setCachedAttorneyProfile(userId, value) {
+  if (!userId || !value) return
+  attorneyProfileCache.set(userId, { value, updatedAt: Date.now() })
+}
+
+export function invalidateAttorneyProfileCache(userId) {
+  if (userId) attorneyProfileCache.delete(userId)
+  else attorneyProfileCache.clear()
+}
 
 const isMissingRelationError = (error) =>
   error?.code === '42P01' || String(error?.message || '').toLowerCase().includes('does not exist')
@@ -33,30 +68,85 @@ const isMissingColumnError = (error, columnName) =>
     .toLowerCase()
     .includes(String(columnName || '').toLowerCase())
 
+/** Production schema (LegalLink-SQL): no slot_date/slot_time on appointments. */
+const APPOINTMENT_ATTORNEY_LIST_SELECT =
+  'id, title, scheduled_at, status, notes, attachment_url, attachment_name, amount, client:client_id(full_name)'
+
+/** Valid `appointment_status` enum values in the deployed database. */
+const APPOINTMENT_STATUS_UPCOMING = ['pending', 'confirmed', 'rescheduled']
+const APPOINTMENT_STATUS_MY_APPOINTMENTS = ['confirmed', 'rescheduled']
+
+function deriveSlotFieldsFromScheduledAt(scheduledAt) {
+  if (!scheduledAt) return { slotDate: null, slotTime: null }
+  const scheduled = new Date(scheduledAt)
+  if (Number.isNaN(scheduled.getTime())) return { slotDate: null, slotTime: null }
+  return {
+    slotDate: scheduled.toISOString().slice(0, 10),
+    slotTime: formatSlotTimeFromDate(scheduled),
+  }
+}
+
+/** Read a picked file into an ArrayBuffer (Android-safe for content:// URIs). */
+async function readLocalFileAsArrayBuffer(uri) {
+  const u = String(uri || '')
+  if (u.startsWith('http://') || u.startsWith('https://')) {
+    const response = await fetch(u)
+    if (!response.ok) {
+      throw new Error('Could not download file.')
+    }
+    const buf = await response.arrayBuffer()
+    if (!buf?.byteLength) {
+      throw new Error('Downloaded file was empty.')
+    }
+    return buf
+  }
+
+  const base64 = await readAsStringAsync(u, { encoding: 'base64' })
+  if (!base64?.length) {
+    throw new Error('Could not read the selected file from this device.')
+  }
+  const binaryString = global.atob(base64)
+  const len = binaryString.length
+  const bytes = new Uint8Array(len)
+  for (let i = 0; i < len; i += 1) {
+    bytes[i] = binaryString.charCodeAt(i)
+  }
+  return bytes.buffer
+}
+
+const sanitizeFilename = (value) =>
+  String(value || 'attachment').replace(/[^a-zA-Z0-9._-]/g, '_')
+
 const toTwoDigits = (value) => String(value).padStart(2, '0')
 
-const normalizePaymentBackendUrl = (value) =>
-  String(value || '').trim().replace(/\/+$/, '')
-
-const PAYMENT_BACKEND_URL = (() => {
-  const explicit = normalizePaymentBackendUrl(
-    process.env.EXPO_PUBLIC_PAYMENT_API_URL ||
-      process.env.EXPO_PUBLIC_PAYMENT_BACKEND_URL ||
-      process.env.EXPO_PUBLIC_BATASMO_PAYMENT_API_URL ||
-      '',
-  )
-  if (explicit) return explicit
-  const apiBase = normalizePaymentBackendUrl(process.env.EXPO_PUBLIC_API_BASE_URL || '')
-  if (!apiBase) return ''
-  return apiBase.replace(/\/api$/, '')
-})()
+const normalizeSlotDateValue = (dateValue) => {
+  if (dateValue instanceof Date && !Number.isNaN(dateValue.getTime())) {
+    const y = dateValue.getFullYear()
+    const m = String(dateValue.getMonth() + 1).padStart(2, '0')
+    const day = String(dateValue.getDate()).padStart(2, '0')
+    return `${y}-${m}-${day}`
+  }
+  const s = String(dateValue || '').trim()
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/)
+  if (m) return m[1]
+  return s.length >= 10 ? s.slice(0, 10) : s
+}
 
 /**
  * Parse legacy `availability_slots.date` + `time` (e.g. 09:00 AM) — aligned with web `BookAppointment`.
  */
 const parseSlotDateTime = (dateValue, timeValue) => {
-  if (!dateValue || !timeValue) return null
+  if (!timeValue) return null
   const rawTime = String(timeValue).trim()
+  if (!rawTime) return null
+
+  if (/[tT]/.test(rawTime) || rawTime.endsWith('Z')) {
+    const isoParsed = new Date(rawTime)
+    if (!Number.isNaN(isoParsed.getTime())) return isoParsed
+  }
+
+  const dateStr = normalizeSlotDateValue(dateValue)
+  if (!dateStr) return null
 
   const ampmMatch = rawTime.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i)
   if (ampmMatch) {
@@ -67,7 +157,7 @@ const parseSlotDateTime = (dateValue, timeValue) => {
     if (meridiem === 'PM' && hour < 12) hour += 12
     if (meridiem === 'AM' && hour === 12) hour = 0
 
-    const parsed = new Date(`${dateValue}T${toTwoDigits(hour)}:${toTwoDigits(minute)}:00`)
+    const parsed = new Date(`${dateStr}T${toTwoDigits(hour)}:${toTwoDigits(minute)}:00`)
     return Number.isNaN(parsed.getTime()) ? null : parsed
   }
 
@@ -87,12 +177,36 @@ const parseSlotDateTime = (dateValue, timeValue) => {
     return null
   }
 
-  const parsed = new Date(`${dateValue}T${toTwoDigits(hour)}:${toTwoDigits(minute)}:00`)
+  const parsed = new Date(`${dateStr}T${toTwoDigits(hour)}:${toTwoDigits(minute)}:00`)
   return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 
+/** Canonical `08:00 AM` label for client booking grids (from DB row or ISO). */
+const canonicalAvailabilitySlotTime = (slot, startIso) => {
+  if (startIso) {
+    const start = new Date(startIso)
+    if (!Number.isNaN(start.getTime())) {
+      const time24 = `${toTwoDigits(start.getHours())}:${toTwoDigits(start.getMinutes())}`
+      return formatHourLabel(time24)
+    }
+  }
+
+  const raw = String(slot?.time || '').trim()
+  if (!raw) return ''
+
+  const parsed = parseSlotDateTime(slot?.date, raw)
+  if (parsed && !Number.isNaN(parsed.getTime())) {
+    const time24 = `${toTwoDigits(parsed.getHours())}:${toTwoDigits(parsed.getMinutes())}`
+    return formatHourLabel(time24)
+  }
+
+  return raw
+}
+
 const webPublicAssetBase = String(
-  process.env.EXPO_PUBLIC_WEB_PUBLIC_URL || process.env.EXPO_PUBLIC_APP_ORIGIN || '',
+  process.env.EXPO_PUBLIC_WEB_PUBLIC_URL ||
+    process.env.EXPO_PUBLIC_APP_ORIGIN ||
+    'https://LegalLink-web.vercel.app',
 )
   .trim()
   .replace(/\/$/, '')
@@ -104,36 +218,17 @@ const supabasePublicBase = String(
   .trim()
   .replace(/\/$/, '')
 
-/**
- * CMS image URL, else known attorney photo paths (same logic as web `april_13`), else ui-avatars.
- * Set `EXPO_PUBLIC_WEB_PUBLIC_URL` to your deployed web origin so `/assets/attorneys/...` resolves on device.
- */
-export function resolveAttorneyImage(name, preferredImageUrl) {
-  const trimmed = String(preferredImageUrl || '').trim()
-  if (trimmed) {
-    if (/^https?:\/\//i.test(trimmed)) return trimmed
+function uiAvatarsFallback(name) {
+  return `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Attorney')}&background=f5a623&color=111827`
+}
 
-    const normalizedPath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
-    const isWebAssetPath = normalizedPath.startsWith('/assets/')
-    if (isWebAssetPath) {
-      return webPublicAssetBase ? `${webPublicAssetBase}${normalizedPath}` : null
-    }
+/** Same display string as mayy16 / web `BookAppointment` cards (`exp: '3 years experience'`). */
+export function formatAttorneyExperienceLabel(_yearsExperience, _biography = '') {
+  return '3 years experience'
+}
 
-    if (trimmed.startsWith('/') && webPublicAssetBase) {
-      return `${webPublicAssetBase}${trimmed}`
-    }
-
-    // If the value looks like a Supabase storage path (e.g. "avatars/xyz.jpg"),
-    // construct a public storage URL using the configured Supabase host so
-    // React Native Image receives a full absolute URL.
-    const possibleStoragePath = trimmed.replace(/^\/+/, '')
-    const looksLikeStorage = /\/.+\.[a-z]{2,}$/i.test(possibleStoragePath) || possibleStoragePath.startsWith('avatars') || possibleStoragePath.startsWith('public/') || possibleStoragePath.includes('storage')
-    if (looksLikeStorage) {
-      return `${supabasePublicBase}/storage/v1/object/public/${possibleStoragePath}`
-    }
-    return trimmed
-  }
-
+/** Known roster photos (web `/assets/attorneys/*`) — always returns an absolute URL for React Native Image. */
+function resolveAttorneyImageByName(name) {
   const normalized = String(name || '')
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
@@ -144,28 +239,76 @@ export function resolveAttorneyImage(name, preferredImageUrl) {
   const asset = (path) =>
     webPublicAssetBase ? `${webPublicAssetBase}${path}` : null
 
-  if (normalized.includes('jeanne') && normalized.includes('anarna')) {
-    return (
-      asset('/assets/attorneys/jeanne-luz-castillo-anarna.jpg') ||
-      `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Attorney')}&background=f5a623&color=111827`
-    )
+  const jeannePhoto =
+    normalized.includes('jeanne') &&
+    (normalized.includes('castillo') ||
+      normalized.includes('luz') ||
+      normalized.includes('anarna'))
+  if (jeannePhoto) {
+    return asset('/assets/attorneys/jeanne-luz-castillo-anarna.jpg') || uiAvatarsFallback(name)
   }
 
-  if (normalized.includes('alston') && normalized.includes('anarna')) {
-    return (
-      asset('/assets/attorneys/alston-kevin-anarna.jpg') ||
-      `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Attorney')}&background=f5a623&color=111827`
-    )
+  const alstonPhoto =
+    normalized.includes('alston') &&
+    (normalized.includes('kevin') || normalized.includes('anarna'))
+  if (alstonPhoto) {
+    return asset('/assets/attorneys/alston-kevin-anarna.jpg') || uiAvatarsFallback(name)
   }
 
-  if (normalized.includes('allen') && normalized.includes('anarna')) {
-    return (
-      asset('/assets/attorneys/allen-kristopher-anarna.png') ||
-      `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Attorney')}&background=f5a623&color=111827`
-    )
+  const allenPhoto =
+    normalized.includes('allen') &&
+    (normalized.includes('kristopher') || normalized.includes('anarna'))
+  if (allenPhoto) {
+    return asset('/assets/attorneys/allen-kristopher-anarna.png') || uiAvatarsFallback(name)
   }
 
-  return `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Attorney')}&background=f5a623&color=111827`
+  return uiAvatarsFallback(name)
+}
+
+/**
+ * CMS image URL, else known attorney photo paths (same logic as web), else ui-avatars.
+ * Set `EXPO_PUBLIC_WEB_PUBLIC_URL` to your deployed web origin so `/assets/attorneys/...` resolves on device.
+ */
+export function resolveAttorneyImage(name, preferredImageUrl) {
+  const trimmed = String(preferredImageUrl || '').trim()
+  const bundledUri = getBundledAttorneyPhotoUri(name)
+
+  // Known roster: bundled files (work offline; same photos as web).
+  if (bundledUri) {
+    return bundledUri
+  }
+
+  if (trimmed) {
+    if (/^https?:\/\//i.test(trimmed)) return trimmed
+
+    const normalizedPath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+    if (normalizedPath.startsWith('/assets/') && webPublicAssetBase) {
+      return `${webPublicAssetBase}${normalizedPath}`
+    }
+
+    if (trimmed.startsWith('/') && webPublicAssetBase) {
+      return `${webPublicAssetBase}${normalizedPath}`
+    }
+
+    const possibleStoragePath = trimmed.replace(/^\/+/, '')
+    const looksLikeStorage =
+      /\/.+\.[a-z]{2,}$/i.test(possibleStoragePath) ||
+      possibleStoragePath.startsWith('avatars') ||
+      possibleStoragePath.startsWith('public/') ||
+      possibleStoragePath.includes('storage')
+    if (looksLikeStorage) {
+      return `${supabasePublicBase}/storage/v1/object/public/${possibleStoragePath}`
+    }
+
+    // Relative CMS path without web origin — match roster / ui-avatars (never return null).
+    if (trimmed.startsWith('/') || !trimmed.includes('://')) {
+      return resolveAttorneyImageByName(name)
+    }
+
+    return trimmed
+  }
+
+  return resolveAttorneyImageByName(name)
 }
 
 const isMissingGuardianColumnError = (error) => {
@@ -208,6 +351,10 @@ function mapAvailabilitySlots(data) {
     const startIso = resolveSlotStartIso(slot)
     const start = new Date(startIso || '')
     const hasValidStart = !Number.isNaN(start.getTime())
+    const canonicalTime = canonicalAvailabilitySlotTime(slot, startIso)
+    const canonicalDate = hasValidStart
+      ? normalizeSlotDateValue(start)
+      : normalizeSlotDateValue(slot.date)
 
     const dateLabel = hasValidStart
       ? start.toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })
@@ -221,10 +368,12 @@ function mapAvailabilitySlots(data) {
     const timeLabel =
       hasValidStart && endForLabel && !Number.isNaN(endForLabel.getTime())
         ? `${start.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' })} - ${endForLabel.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' })}`
-        : String(slot.time || 'TBD')
+        : canonicalTime || 'TBD'
 
     return {
       ...slot,
+      date: canonicalDate || slot.date,
+      time: canonicalTime || slot.time,
       startTime: startIso,
       dateLabel,
       timeLabel,
@@ -299,6 +448,7 @@ export function setCachedProfile(profile) {
 
 export function clearCachedProfile() {
   clearMemoryProfileCache();
+  invalidateAttorneyProfileCache();
 }
 
 export async function getCurrentSessionProfile() {
@@ -426,8 +576,131 @@ export async function upsertProfile(profile) {
 
   // Ignore compatibility sync failures (e.g., users table missing in some setups).
   if (usersSync?.error) {
-    console.warn('[BatasMo] users sync skipped:', usersSync.error.message)
+    console.warn('[LegalLink] users sync skipped:', usersSync.error.message)
   }
+}
+
+const CLIENT_CONSULTATION_QUEUE_STATUSES = new Set([
+  'pending',
+  'confirmed',
+  'rescheduled',
+])
+
+function formatSlotTimeFromDate(date) {
+  const parsed = new Date(date)
+  if (Number.isNaN(parsed.getTime())) return null
+  const hour = parsed.getHours()
+  const minute = parsed.getMinutes()
+  const period = hour >= 12 ? 'PM' : 'AM'
+  const normalizedHour = hour % 12 || 12
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(normalizedHour)}:${pad(minute)} ${period}`
+}
+
+export function calendarDaysFromTodayLocal(value) {
+  if (!value) return null
+
+  let target
+  if (value instanceof Date) {
+    target = new Date(value)
+  } else {
+    const str = String(value).trim()
+    const ymd = str.match(/^(\d{4})-(\d{2})-(\d{2})/)
+    if (ymd) {
+      target = new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]))
+    } else {
+      target = new Date(str)
+    }
+  }
+
+  if (!target || Number.isNaN(target.getTime())) return null
+
+  const today = new Date()
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()
+  const startOfTarget = new Date(target.getFullYear(), target.getMonth(), target.getDate()).getTime()
+  const msPerDay = 24 * 60 * 60 * 1000
+  return Math.round((startOfTarget - startOfToday) / msPerDay)
+}
+
+function mapRowToClientConsultationQueueItem(item, paymentStatus) {
+  const scheduled = item.scheduled_at ? new Date(item.scheduled_at) : null
+  const hasScheduled = scheduled && !Number.isNaN(scheduled.getTime())
+  const derivedSlotDate = hasScheduled ? scheduled.toISOString().slice(0, 10) : null
+  const derivedSlotTime = hasScheduled ? formatSlotTimeFromDate(scheduled) : null
+  const paid = String(paymentStatus || '').toLowerCase() === 'paid'
+
+  return {
+    id: item.id,
+    name: item.attorney?.full_name || 'Attorney',
+    area: item.title || 'Consultation',
+    date: item.scheduled_at,
+    time: item.scheduled_at,
+    scheduledAt: item.scheduled_at || null,
+    slotDate: derivedSlotDate,
+    slotTime: derivedSlotTime,
+    status: item.status || 'pending',
+    payment: paid ? 'Paid' : 'Unpaid',
+    amount: Number(item.amount || 0),
+    attorney_id: item.attorney_id,
+    notes: item.notes || '',
+    pendingReschedule: parseReschedulePendingFromNotes(item.notes),
+    payment_is_paid: paid,
+    chatAccessible: isConsultationChatWindowOpen({
+      status: item.status,
+      scheduledAt: item.scheduled_at,
+      slotDate: derivedSlotDate,
+      slotTime: derivedSlotTime,
+    }),
+  }
+}
+
+export function invalidateClientHomeCache(userId) {
+  if (userId) {
+    clientHomeCache.delete(userId)
+    clientHomeCache.delete(`queue:${userId}`)
+    return
+  }
+  clientHomeCache.clear()
+}
+
+export async function fetchClientConsultationQueue(userId, options = {}) {
+  if (!userId) return []
+
+  const force = Boolean(options?.force)
+  const cacheKey = `queue:${userId}`
+  const cached = clientHomeCache.get(cacheKey)
+  if (!force && cached && Date.now() - cached.updatedAt < DASHBOARD_CACHE_TTL_MS) {
+    return cached.value
+  }
+
+  const [appointmentsRes, transactionsRes] = await Promise.all([
+    supabase
+      .from('appointments')
+      .select('id, title, notes, scheduled_at, status, attorney_id, amount, attorney:attorney_id(full_name)')
+      .eq('client_id', userId)
+      .order('scheduled_at', { ascending: true }),
+    supabase
+      .from('transactions')
+      .select('appointment_id, payment_status')
+      .eq('client_id', userId),
+  ])
+
+  if (appointmentsRes.error) throw appointmentsRes.error
+  if (transactionsRes.error) throw transactionsRes.error
+
+  const paymentByAppointment = new Map(
+    (transactionsRes.data || []).map((tx) => [tx.appointment_id, tx.payment_status]),
+  )
+
+  const appointments = (appointmentsRes.data || [])
+    .filter((item) => {
+      const status = String(item.status || '').toLowerCase()
+      return CLIENT_CONSULTATION_QUEUE_STATUSES.has(status)
+    })
+    .map((item) => mapRowToClientConsultationQueueItem(item, paymentByAppointment.get(item.id)))
+
+  clientHomeCache.set(cacheKey, { value: appointments, updatedAt: Date.now() })
+  return appointments
 }
 
 export async function fetchClientHomeData(userId) {
@@ -436,40 +709,28 @@ export async function fetchClientHomeData(userId) {
     return cached.value
   }
 
-  const [profileRes, appointmentsRes, notificationsRes, transactionsRes] = await Promise.all([
-    supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', userId),
-    supabase
-      .from('appointments')
-      .select('id, title, scheduled_at, status, attorney:attorney_id(full_name), amount')
-      .eq('client_id', userId)
-      .order('scheduled_at', { ascending: true }),
+  const [appointments, notificationsRes] = await Promise.all([
+    fetchClientConsultationQueue(userId, { force: true }),
     supabase
       .from('notifications')
       .select('id, title, body, type, is_read, created_at')
       .eq('user_id', userId)
-      .order('created_at', { ascending: false }),
-    supabase
-      .from('transactions')
-      .select('id, amount, payment_status, created_at')
-      .eq('client_id', userId)
-      .order('created_at', { ascending: false }),
+      .order('created_at', { ascending: false })
+      .limit(20),
   ])
 
-  if (profileRes.error) throw profileRes.error
-  if (appointmentsRes.error) throw appointmentsRes.error
   if (notificationsRes.error) throw notificationsRes.error
-  if (transactionsRes.error) throw transactionsRes.error
 
-  const result = {
-    profile: profileRes.data,
-    appointments: appointmentsRes.data || [],
-    notifications: notificationsRes.data || [],
-    transactions: transactionsRes.data || [],
-  }
+  const notifications = (notificationsRes.data || []).map((n) => ({
+    id: n.id,
+    type: n.type || 'general',
+    title: n.title,
+    desc: n.body,
+    time: n.created_at ? new Date(n.created_at).toLocaleString() : 'Now',
+    read: n.is_read,
+  }))
 
+  const result = { appointments, notifications }
   clientHomeCache.set(userId, { value: result, updatedAt: Date.now() })
   return result
 }
@@ -499,6 +760,7 @@ export async function saveAttorneyProfile(userId, values) {
   )
 
   if (error) throw error
+  invalidateAttorneyProfileCache(userId)
 }
 
 export async function upsertClientProfiling(userId, values) {
@@ -652,13 +914,20 @@ export async function saveAttorneyAvailabilitySlots({ attorneyId, slots }) {
   if (normalizedSlots.length === 0) return []
 
   if (usingLegacySchema) {
-    const legacyRows = normalizedSlots.map((slot) => ({
-      attorney_id: slot.attorney_id,
-      date: String(slot.start_time).slice(0, 10),
-      time: slot.start_time,
-      is_booked: false,
-      updated_at: nowIso,
-    }))
+    const legacyRows = normalizedSlots
+      .map((slot) => {
+        const start = new Date(slot.start_time)
+        if (Number.isNaN(start.getTime())) return null
+        const time24 = `${toTwoDigits(start.getHours())}:${toTwoDigits(start.getMinutes())}`
+        return {
+          attorney_id: slot.attorney_id,
+          date: normalizeSlotDateValue(start),
+          time: formatHourLabel(time24),
+          is_booked: false,
+          updated_at: nowIso,
+        }
+      })
+      .filter(Boolean)
 
     const inserted = await supabase
       .from('availability_slots')
@@ -686,43 +955,17 @@ export async function saveAttorneyAvailabilitySlots({ attorneyId, slots }) {
 
 const normalizeDigitalPaymentMethod = (method) => {
   const value = String(method || '').trim().toLowerCase()
-  if (value === 'gcash') return 'GCash'
-  if (value === 'maya' || value === 'paymaya') return 'Maya'
   if (value === 'qrph' || value === 'qr_ph' || value === 'qr ph') return 'QRPh'
-  throw new Error('Supported payment methods are GCash, Maya, or QR Ph.')
+  throw new Error('Only QR Ph payments are supported.')
 }
 
 const normalizePaymentMethodKey = (method) => {
   const value = String(method || '').trim().toLowerCase()
-  if (value === 'gcash') return 'gcash'
-  if (value === 'maya' || value === 'paymaya') return 'paymaya'
   if (value === 'qrph' || value === 'qr_ph' || value === 'qr ph') return 'qrph'
-  throw new Error('Supported payment methods are gcash, paymaya, or qrph.')
+  throw new Error('Only qrph payments are supported.')
 }
 
-const normalizePaymentMethodTypes = (methodTypes, fallbackMethod) => {
-  const rawList = Array.isArray(methodTypes)
-    ? methodTypes
-    : methodTypes
-      ? [methodTypes]
-      : []
-
-  const normalized = rawList
-    .map((item) => {
-      try {
-        return normalizePaymentMethodKey(item)
-      } catch {
-        return null
-      }
-    })
-    .filter(Boolean)
-
-  if (normalized.length > 0) {
-    return [...new Set(normalized)]
-  }
-
-  return [normalizePaymentMethodKey(fallbackMethod || 'gcash')]
-}
+const normalizePaymentMethodTypes = (_methodTypes, _fallbackMethod) => ['qrph']
 
 const normalizeAppointmentStatus = (status) => {
   const value = (status || '').toLowerCase()
@@ -731,6 +974,80 @@ const normalizeAppointmentStatus = (status) => {
   if (value === 'completed') return 'COMPLETED'
   if (value === 'rejected' || value === 'cancelled') return 'REJECTED'
   return 'PENDING'
+}
+
+const CHAT_ACTIVE_APPOINTMENT_STATUSES = new Set(['confirmed', 'rescheduled'])
+
+const CHAT_ACCESS_BLOCKED_MESSAGE =
+  'Consultation chat is unavailable until the appointment status is marked as started/active.'
+
+const parseChatScheduleDate = ({ scheduledAt, slotDate, slotTime } = {}) => {
+  if (slotDate && slotTime) {
+    const fromSlot = parseSlotDateTime(slotDate, slotTime)
+    if (fromSlot && !Number.isNaN(fromSlot.getTime())) return fromSlot
+  }
+
+  const raw = String(scheduledAt || '').trim()
+  if (!raw) return null
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw) && slotTime) {
+    const fromDateAndTime = parseSlotDateTime(raw, slotTime)
+    if (fromDateAndTime && !Number.isNaN(fromDateAndTime.getTime())) return fromDateAndTime
+  }
+
+  const parsed = new Date(raw)
+  return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
+const PH_TZ = 'Asia/Manila'
+
+const toPhDateKey = (value) => {
+  if (!value) return null
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: PH_TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date)
+}
+
+export const buildChatScheduleBlockedMessage = ({ scheduledAt, slotDate, slotTime } = {}) => {
+  const parsed = parseChatScheduleDate({ scheduledAt, slotDate, slotTime })
+  if (!parsed) return CHAT_ACCESS_BLOCKED_MESSAGE
+
+  const date = parsed.toLocaleDateString('en-PH', {
+    timeZone: PH_TZ,
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })
+  return `Consultation chat opens on ${date} (any time that day, PH time).`
+}
+
+export const isConsultationChatActiveStatus = (status) =>
+  CHAT_ACTIVE_APPOINTMENT_STATUSES.has(String(status || '').toLowerCase())
+
+/**
+ * Web parity for testing: room opens any hour on the scheduled calendar day
+ * (Asia/Manila), not only at the exact slot time. Blocked on earlier days.
+ */
+export const isConsultationChatWindowOpen = ({ status, scheduledAt, slotDate, slotTime, nowValue } = {}) => {
+  if (!isConsultationChatActiveStatus(status)) return false
+
+  const scheduled = parseChatScheduleDate({ scheduledAt, slotDate, slotTime })
+  if (!scheduled) return false
+
+  const now = nowValue instanceof Date ? nowValue : new Date(nowValue || Date.now())
+  if (Number.isNaN(now.getTime())) return false
+
+  const todayKey = toPhDateKey(now)
+  const consultationKey = toPhDateKey(scheduled)
+  if (!todayKey || !consultationKey) return false
+
+  // Open from the start of the scheduled day onward (same-day early entry OK).
+  return todayKey >= consultationKey
 }
 
 export async function fetchClientAppointmentsData(userId) {
@@ -794,29 +1111,18 @@ export async function fetchClientAppointmentsData(userId) {
 export async function payForAppointment({ appointmentId, clientId, attorneyId, amount, method, methodTypes }) {
   const paymentMethod = normalizePaymentMethodKey(method)
   const paymentMethodTypes = normalizePaymentMethodTypes(methodTypes, paymentMethod)
-  if (!PAYMENT_BACKEND_URL) {
-    throw new Error(
-      'Payment backend URL is not configured. Set EXPO_PUBLIC_PAYMENT_API_URL and restart Expo.'
-    )
-  }
 
-  const response = await fetch(`${PAYMENT_BACKEND_URL}/payments/appointments/create-session`, {
+  const payload = await requestPaymentApi('/payments/appointments/create-session', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+    body: {
       appointmentId,
       clientId,
       attorneyId,
       amount: Number(amount || 0),
       method: paymentMethod,
       paymentMethodTypes,
-    }),
+    },
   })
-
-  const payload = await response.json().catch(() => null)
-  if (!response.ok) {
-    throw new Error(payload?.error || `Unable to initialize payment (${response.status})`)
-  }
 
   if (!payload?.checkoutUrl || !payload?.transactionId) {
     throw new Error('Payment provider returned an invalid session payload.')
@@ -831,34 +1137,24 @@ export async function payForAppointment({ appointmentId, clientId, attorneyId, a
 }
 
 /**
- * Creates a PayMongo checkout session for a notarial service request.
- * Calls POST /payments/notarial/create-session on the backend.
+ * @deprecated Not used on mobile — web has no PayMongo notarial route. Use payForNotarialRequest.
+ * Creates a PayMongo checkout session via POST /payments/notarial/create-session (local backend only).
  */
 export async function payForNotarialSession({ notarialRequestId, clientId, amount, method, methodTypes }) {
   const paymentMethod = normalizePaymentMethodKey(method)
   const paymentMethodTypes = normalizePaymentMethodTypes(methodTypes, paymentMethod)
-  if (!PAYMENT_BACKEND_URL) {
-    throw new Error(
-      'Payment backend URL is not configured. Set EXPO_PUBLIC_PAYMENT_API_URL and restart Expo.'
-    )
-  }
 
-  const response = await fetch(`${PAYMENT_BACKEND_URL}/payments/notarial/create-session`, {
+  const payload = await requestPaymentApi('/payments/notarial/create-session', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+    body: {
       notarialRequestId,
       clientId,
       amount: Number(amount || 0),
       method: paymentMethod,
       paymentMethodTypes,
-    }),
+    },
   })
 
-  const payload = await response.json().catch(() => null)
-  if (!response.ok) {
-    throw new Error(payload?.error || `Unable to initialize notarial payment (${response.status})`)
-  }
   if (!payload?.checkoutUrl || !payload?.transactionId) {
     throw new Error('Payment provider returned an invalid session payload.')
   }
@@ -876,20 +1172,10 @@ export async function payForNotarialSession({ notarialRequestId, clientId, amoun
  */
 export async function getNotarialPaymentStatus(transactionId) {
   if (!transactionId) throw new Error('transactionId is required')
-  if (!PAYMENT_BACKEND_URL) {
-    throw new Error(
-      'Payment backend URL is not configured. Set EXPO_PUBLIC_PAYMENT_API_URL and restart Expo.'
-    )
-  }
 
-  const response = await fetch(
-    `${PAYMENT_BACKEND_URL}/payments/notarial/status/${encodeURIComponent(transactionId)}`,
-    { method: 'GET' },
+  const payload = await requestPaymentApi(
+    `/payments/notarial/status/${encodeURIComponent(transactionId)}`,
   )
-  const payload = await response.json().catch(() => null)
-  if (!response.ok) {
-    throw new Error(payload?.error || `Unable to check notarial payment status (${response.status})`)
-  }
   return {
     transactionId: payload?.transactionId || transactionId,
     notarialRequestId: payload?.notarialRequestId || null,
@@ -899,20 +1185,10 @@ export async function getNotarialPaymentStatus(transactionId) {
 
 export async function getAppointmentPaymentStatus(transactionId) {
   if (!transactionId) throw new Error('transactionId is required')
-  if (!PAYMENT_BACKEND_URL) {
-    throw new Error(
-      'Payment backend URL is not configured. Set EXPO_PUBLIC_PAYMENT_API_URL and restart Expo.'
-    )
-  }
 
-  const response = await fetch(
-    `${PAYMENT_BACKEND_URL}/payments/appointments/status/${encodeURIComponent(transactionId)}`,
-    { method: 'GET' },
+  const payload = await requestPaymentApi(
+    `/payments/appointments/status/${encodeURIComponent(transactionId)}`,
   )
-  const payload = await response.json().catch(() => null)
-  if (!response.ok) {
-    throw new Error(payload?.error || `Unable to check payment status (${response.status})`)
-  }
   return {
     transactionId: payload?.transactionId || transactionId,
     appointmentId: payload?.appointmentId || null,
@@ -965,6 +1241,35 @@ async function fetchAdminUserIds() {
     return []
   }
   return (data || []).map((row) => row?.id).filter(Boolean)
+}
+
+/** Notarial requests are reviewed on the admin console (web), not by attorneys. */
+export async function notifyAdminsOfNewNotarialRequest({
+  clientId,
+  serviceType,
+  preferredDate,
+}) {
+  try {
+    const adminIds = await fetchAdminUserIds()
+    if (!adminIds.length) return
+
+    const clientName = await resolveClientDisplayName(clientId)
+    const preferredLabel = preferredDate
+      ? new Date(preferredDate).toLocaleDateString('en-PH', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        })
+      : 'an unspecified date'
+
+    await insertNotificationsForUserIds(adminIds, {
+      title: 'New notarial request',
+      body: `${clientName} submitted a ${serviceType || 'notarial'} request for ${preferredLabel}. [adminnewnot:${clientId}:${Date.now()}]`,
+      type: 'admin_general',
+    })
+  } catch (notifyError) {
+    console.warn('[notarial] admin notify failed', notifyError)
+  }
 }
 
 async function insertNotificationsForUserIds(userIds, { title, body, type = 'general' }) {
@@ -1222,7 +1527,7 @@ export async function cancelPendingUnpaidBooking({ appointmentId }) {
 
   const { data: appt, error: apptError } = await supabase
     .from('appointments')
-    .select('id, attorney_id, client_id, title, scheduled_at, slot_id, slot_date, slot_time, status')
+    .select('id, attorney_id, client_id, title, scheduled_at, slot_id, status')
     .eq('id', appointmentId)
     .maybeSingle()
 
@@ -1298,21 +1603,22 @@ export async function cancelPendingUnpaidBooking({ appointmentId }) {
   }
 
   let slotIdToFree = appt.slot_id || null
+  const { slotDate, slotTime } = deriveSlotFieldsFromScheduledAt(appt.scheduled_at)
 
-  if (!slotIdToFree && appt.attorney_id && appt.slot_date && appt.slot_time) {
+  if (!slotIdToFree && appt.attorney_id && slotDate && slotTime) {
     const { data: candidateSlots, error: candidateError } = await supabase
       .from('availability_slots')
       .select('id, time')
       .eq('attorney_id', appt.attorney_id)
-      .eq('date', appt.slot_date)
+      .eq('date', slotDate)
 
     if (candidateError) {
       console.warn('[booking] cancel cleanup candidate slot fetch failed', candidateError)
     } else if (Array.isArray(candidateSlots) && candidateSlots.length) {
-      const targetParsed = parseSlotDateTime(appt.slot_date, appt.slot_time)
+      const targetParsed = parseSlotDateTime(slotDate, slotTime)
       const targetMs = targetParsed?.getTime() || 0
       const matchedSlot = candidateSlots.find((slot) => {
-        const slotParsed = parseSlotDateTime(appt.slot_date, slot?.time)
+        const slotParsed = parseSlotDateTime(slotDate, slot?.time)
         return slotParsed && slotParsed.getTime() === targetMs
       })
       slotIdToFree = matchedSlot?.id || null
@@ -1327,13 +1633,13 @@ export async function cancelPendingUnpaidBooking({ appointmentId }) {
     if (slotByIdError) {
       console.warn('[booking] cancel cleanup slot free (by id) failed', slotByIdError)
     }
-  } else if (appt.attorney_id && appt.slot_date && appt.slot_time) {
+  } else if (appt.attorney_id && slotDate && slotTime) {
     const { error: slotByMatchError } = await supabase
       .from('availability_slots')
       .update({ is_booked: false, updated_at: nowIso })
       .eq('attorney_id', appt.attorney_id)
-      .eq('date', appt.slot_date)
-      .eq('time', appt.slot_time)
+      .eq('date', slotDate)
+      .eq('time', slotTime)
     if (slotByMatchError) {
       console.warn('[booking] cancel cleanup slot free (raw match) failed', slotByMatchError)
     }
@@ -1345,22 +1651,16 @@ export async function abandonAppointmentCheckout({ appointmentId, clientId, tran
   if (!appointmentId) throw new Error('appointmentId is required')
   if (!clientId) throw new Error('clientId is required')
 
-  if (!PAYMENT_BACKEND_URL) {
+  try {
+    const payload = await requestPaymentApi('/payments/appointments/abandon', {
+      method: 'POST',
+      body: { appointmentId, clientId, transactionId },
+    })
+    return payload || { ok: true }
+  } catch {
     await cancelPendingUnpaidBooking({ appointmentId })
     return { ok: true, reason: 'fallback' }
   }
-
-  const response = await fetch(`${PAYMENT_BACKEND_URL}/payments/appointments/abandon`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ appointmentId, clientId, transactionId }),
-  })
-
-  const payload = await response.json().catch(() => null)
-  if (!response.ok) {
-    throw new Error(payload?.error || `Unable to abandon checkout (${response.status})`)
-  }
-  return payload || { ok: true }
 }
 
 export async function requestAppointmentReschedule({ appointmentId, scheduledAt, note }) {
@@ -1374,55 +1674,206 @@ export async function requestAppointmentReschedule({ appointmentId, scheduledAt,
 
 const normalizeNotarialStatus = (status) => {
   const value = (status || '').toLowerCase()
-  if (value === 'approved') return 'APPROVED'
+  if (value === 'accepted' || value === 'approved' || value === 'paid') return 'ACCEPTED'
   if (value === 'completed') return 'COMPLETED'
   if (value === 'rejected' || value === 'cancelled') return 'REJECTED'
   return 'PENDING'
+}
+
+const BUNDLED_APPOINTMENT_NOTE_RE =
+  /Bundled with consultation appointment\s+([0-9a-f-]{36})/i
+
+function isPaymentStatusPaid(raw) {
+  const paymentNorm = String(raw || '').toLowerCase()
+  return (
+    paymentNorm === 'paid' ||
+    paymentNorm === 'succeeded' ||
+    paymentNorm === 'success'
+  )
+}
+
+/**
+ * Heal orphan bundled notarial rows that were created before PayMongo pay
+ * but never linked to the paid appointment transaction.
+ */
+async function healBundledNotarialPayments(userId, requests, paymentByRequest) {
+  const orphans = (requests || []).filter((item) => {
+    if (isPaymentStatusPaid(paymentByRequest.get(item.id))) return false
+    const noteText = String(item.notes || item.details || '')
+    return BUNDLED_APPOINTMENT_NOTE_RE.test(noteText)
+  })
+  if (!orphans.length) return paymentByRequest
+
+  const appointmentIds = orphans
+    .map((item) => {
+      const noteText = String(item.notes || item.details || '')
+      const match = noteText.match(BUNDLED_APPOINTMENT_NOTE_RE)
+      return match?.[1] || null
+    })
+    .filter(Boolean)
+
+  if (!appointmentIds.length) return paymentByRequest
+
+  const { data: paidApptTxs, error } = await supabase
+    .from('transactions')
+    .select('id, appointment_id, payment_status')
+    .eq('client_id', userId)
+    .in('appointment_id', appointmentIds)
+
+  if (error || !paidApptTxs?.length) return paymentByRequest
+
+  const paidTxByAppointment = new Map()
+  for (const tx of paidApptTxs) {
+    if (isPaymentStatusPaid(tx.payment_status) && tx.appointment_id) {
+      paidTxByAppointment.set(tx.appointment_id, tx)
+    }
+  }
+
+  const nextMap = new Map(paymentByRequest)
+  const nowIso = new Date().toISOString()
+
+  await Promise.all(
+    orphans.map(async (item) => {
+      const noteText = String(item.notes || item.details || '')
+      const match = noteText.match(BUNDLED_APPOINTMENT_NOTE_RE)
+      const appointmentId = match?.[1]
+      const paidTx = appointmentId ? paidTxByAppointment.get(appointmentId) : null
+      if (!paidTx?.id) return
+
+      nextMap.set(item.id, 'paid')
+
+      try {
+        await supabase
+          .from('transactions')
+          .update({ notarial_request_id: item.id, updated_at: nowIso })
+          .eq('id', paidTx.id)
+      } catch (linkErr) {
+        console.warn('[notarial] heal link tx failed', linkErr?.message || linkErr)
+      }
+
+      try {
+        await supabase
+          .from('notarial_requests')
+          .update({ status: 'accepted', updated_at: nowIso })
+          .eq('id', item.id)
+      } catch (statusErr) {
+        console.warn('[notarial] heal status failed', statusErr?.message || statusErr)
+      }
+    }),
+  )
+
+  return nextMap
 }
 
 export async function fetchClientNotarialRequests(userId) {
   const [requestsRes, transactionsRes] = await Promise.all([
     supabase
       .from('notarial_requests')
-      .select('id, service_type, details, document_url, preferred_date, status, created_at, attorney_id, attorney:attorney_id(full_name)')
+      .select(
+        'id, service_type, document_url, details, notes, status, created_at, amount, attorney_id, attorney:attorney_id(full_name)',
+      )
       .eq('client_id', userId)
       .order('created_at', { ascending: false }),
     supabase
       .from('transactions')
-      .select('notarial_request_id, payment_status')
+      .select('notarial_request_id, payment_status, appointment_id')
       .eq('client_id', userId),
   ])
 
   if (requestsRes.error) throw requestsRes.error
   if (transactionsRes.error) throw transactionsRes.error
 
-  const paymentByRequest = new Map(
-    (transactionsRes.data || []).map((tx) => [tx.notarial_request_id, tx.payment_status]),
+  let paymentByRequest = new Map(
+    (transactionsRes.data || [])
+      .filter((tx) => tx.notarial_request_id)
+      .map((tx) => [tx.notarial_request_id, tx.payment_status]),
+  )
+
+  paymentByRequest = await healBundledNotarialPayments(
+    userId,
+    requestsRes.data || [],
+    paymentByRequest,
   )
 
   return (requestsRes.data || []).map((item) => {
     const status = normalizeNotarialStatus(item.status)
     const datetime = formatDateTime(item.created_at)
-    const paymentStatus = (paymentByRequest.get(item.id) || 'unpaid').toLowerCase()
+    const paymentRaw = paymentByRequest.get(item.id) || 'unpaid'
+    const isPaid = isPaymentStatusPaid(paymentRaw)
+    const noteText = item.notes || item.details || ''
+    // If we just healed this row, surface ACCEPTED instead of PENDING.
+    const displayStatus =
+      isPaid && status === 'PENDING' ? 'ACCEPTED' : status
+    const resolvedAmount = resolveNotarialAmount(item.amount)
     return {
       id: item.id,
       service: item.service_type || 'Notarial Service',
       description: item.service_type || 'Notarial request',
       date: datetime.date,
       file: item.document_url || 'N/A',
-      notes: item.details || '',
-      status,
-      payment: paymentStatus === 'paid' ? 'PAID' : 'UNPAID',
-      fee: 'PHP 0.00',
-      amount: 0,
-      message: status === 'COMPLETED' ? 'Notarization Completed' : status === 'APPROVED' ? 'Ready for Review' : 'Waiting for Review',
-      detail: item.details || 'Request submitted for review.',
+      notes: noteText,
+      details: noteText,
+      status: displayStatus,
+      payment: isPaid ? 'PAID' : 'UNPAID',
+      payment_is_paid: isPaid,
+      fee: `PHP ${resolvedAmount.toFixed(2)}`,
+      amount: resolvedAmount,
+      message:
+        displayStatus === 'COMPLETED'
+          ? 'Notarization Completed'
+          : displayStatus === 'ACCEPTED' || displayStatus === 'APPROVED'
+            ? 'Ready for Review'
+            : 'Waiting for Review',
+      detail: noteText || 'Request submitted for review.',
       assignedTo: item.attorney?.full_name || null,
       attorneyId: item.attorney_id || null,
     }
   })
 }
 
+/** Realtime updates when admin changes notary status (web ClientNotaryTracking parity). */
+export function subscribeToClientNotarialRequests(clientId, onChange) {
+  if (!clientId) return () => {}
+
+  const { schedule, dispose } = createDebouncedRealtimeHandler(() => {
+    onChange?.()
+  })
+
+  const channel = supabase
+    .channel(`client-notary:${clientId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'notarial_requests',
+        filter: `client_id=eq.${clientId}`,
+      },
+      () => schedule(),
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'transactions',
+        filter: `client_id=eq.${clientId}`,
+      },
+      () => schedule(),
+    )
+    .subscribe()
+
+  return () => {
+    dispose()
+    try {
+      supabase.removeChannel(channel)
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Web parity: record notarial payment in Supabase (no /payments/notarial/* PayMongo route). */
 export async function payForNotarialRequest({ requestId, clientId, attorneyId, amount, method }) {
   const paymentMethod = normalizeDigitalPaymentMethod(method)
 
@@ -1436,8 +1887,6 @@ export async function payForNotarialRequest({ requestId, clientId, attorneyId, a
     created_at: nowIso,
     updated_at: nowIso,
   }
-  // attorney_id may be null when admin has not yet assigned one —
-  // only include it if present so the DB column default (NULL) is used.
   if (attorneyId) txPayload.attorney_id = attorneyId
 
   const { data: txRow, error: txError } = await supabase
@@ -1450,10 +1899,32 @@ export async function payForNotarialRequest({ requestId, clientId, attorneyId, a
 
   const { error: reqError } = await supabase
     .from('notarial_requests')
-    .update({ status: 'approved', updated_at: nowIso })
+    .update({ status: 'accepted', updated_at: nowIso })
     .eq('id', requestId)
 
   if (reqError) throw reqError
+
+  try {
+    const { data: row } = await supabase
+      .from('notarial_requests')
+      .select('service_type')
+      .eq('id', requestId)
+      .maybeSingle()
+    const adminIds = await fetchAdminUserIds()
+    if (adminIds.length) {
+      const clientName = await resolveClientDisplayName(clientId)
+      const amt = Number(amount || 0)
+      const amtLabel = amt > 0 ? `PHP ${amt.toLocaleString()}` : 'the agreed fee'
+      const svc = row?.service_type || 'notarial request'
+      await insertNotificationsForUserIds(adminIds, {
+        title: 'Notarial payment received',
+        body: `${clientName} paid ${amtLabel} for ${svc} (request ${String(requestId).slice(0, 8)}…). [adminnotpaid:${requestId}]`,
+        type: 'admin_general',
+      })
+    }
+  } catch (notifyErr) {
+    console.warn('[notarial] payment admin notify failed', notifyErr?.message || notifyErr)
+  }
 
   return { transactionId: txRow?.id ?? null }
 }
@@ -1482,12 +1953,10 @@ export async function fetchAppointmentPaymentDetails(appointmentId) {
   }
 }
 
-const NOTARIAL_PAYMENT_DEFAULT_AMOUNT = 1 // TEST AMOUNT — change to 4000 before go-live
-
 export async function fetchNotarialPaymentDetails(requestId) {
   const { data, error } = await supabase
     .from('notarial_requests')
-    .select('attorney_id')
+    .select('attorney_id, service_type, amount')
     .eq('id', requestId)
     .maybeSingle()
 
@@ -1495,7 +1964,8 @@ export async function fetchNotarialPaymentDetails(requestId) {
   if (!data) throw new Error('Notarial request not found.')
   return {
     attorneyId: data.attorney_id,
-    amount: NOTARIAL_PAYMENT_DEFAULT_AMOUNT,
+    serviceType: data.service_type,
+    amount: resolveNotarialAmount(data.amount),
   }
 }
 
@@ -1629,7 +2099,7 @@ export async function fetchAvailability(attorneyId, date) {
         isMissingAvailabilityColumnError(error))
     ) {
       const rows = await fetchAvailabilitySlotsByStartTimeDay(attorneyId, date)
-      return mapAvailabilitySlots(rows)
+      return sortAvailabilitySlotsChronologically(mapAvailabilitySlots(rows))
     }
     throw error
   }
@@ -1642,7 +2112,7 @@ export async function fetchAvailability(attorneyId, date) {
     }
   }
 
-  return mapAvailabilitySlots(rows)
+  return sortAvailabilitySlotsChronologically(mapAvailabilitySlots(rows))
 }
 
 export async function fetchBookableAttorneys({ concern = '', onlyVerified = true } = {}) {
@@ -1829,7 +2299,14 @@ export async function fetchBookableAttorneys({ concern = '', onlyVerified = true
 
       availabilityByAttorney = (slots || []).reduce((map, slot) => {
         const list = map.get(slot.attorney_id) || []
-        const start = parseSlotDateTime(slot.date, slot.time)
+        let start = parseSlotDateTime(slot.date, slot.time)
+        if (!start) {
+          const startIso = resolveSlotStartIso(slot)
+          if (startIso) {
+            const parsed = new Date(startIso)
+            if (!Number.isNaN(parsed.getTime())) start = parsed
+          }
+        }
         if (!start || start <= new Date()) {
           map.set(slot.attorney_id, list)
           return map
@@ -1876,6 +2353,7 @@ export async function fetchBookableAttorneys({ concern = '', onlyVerified = true
       const experienceYears = Number(item.years_experience || 0)
       const fee = Number(item.consultation_fee || 2000)
       const availableSlots = availabilityByAttorney.get(item.user_id) || []
+      const biography = cms?.biography || item.bio || ''
 
       return {
         id: item.user_id,
@@ -1883,11 +2361,9 @@ export async function fetchBookableAttorneys({ concern = '', onlyVerified = true
         specialty: normalizeStringArray(cms?.expertise_fields)[0] || primarySpecialty,
         specialties: normalizeStringArray(cms?.expertise_fields || item.specialties),
         practiceAreas: normalizeStringArray(cms?.practice_areas || item.specialties),
-        exp:
-          experienceYears > 0
-            ? `${experienceYears} years experience`
-            : 'Experience not set',
-        rating: 5,
+        // Match mayy16 / web Book Appointment card label (not raw DB test values like 5).
+        exp: '3 years experience',
+        yearsExperience: experienceYears,
         price: `PHP ${fee.toFixed(2)}`,
         amount: fee,
         bio: cms?.biography || item.bio || 'No biography available yet.',
@@ -1961,6 +2437,111 @@ export async function fetchPublicLandingData() {
   return { content, attorneys: gallery }
 }
 
+/**
+ * Uploads an optional client-provided file that should accompany a new
+ * consultation booking. Uses the public `appointment-attachments` bucket and
+ * returns `{ url, name }` so the caller can persist it onto the appointment.
+ */
+export async function uploadAppointmentAttachment({ clientId, file }) {
+  if (!file?.uri) return null
+  if (!clientId) throw new Error('clientId is required to upload an attachment.')
+
+  const originalName = String(file.name || file.fileName || '').trim()
+  const safeName = sanitizeFilename(originalName || 'attachment')
+  const filePath = `${clientId}/${Date.now()}_${safeName}`
+  const ext = safeName.split('.').pop() || 'bin'
+
+  const buffer = await readLocalFileAsArrayBuffer(file.uri)
+
+  const { error: uploadError } = await supabase.storage
+    .from('appointment-attachments')
+    .upload(filePath, buffer, {
+      contentType: file.mimeType || file.type || `application/${ext}`,
+      upsert: false,
+    })
+
+  if (uploadError) {
+    const rlsHint =
+      /row-level security|violates row-level security/i.test(String(uploadError.message || ''))
+        ? ' In Supabase, run database/20260514_appointment_attachments_storage_rls.sql (SQL Editor).'
+        : ''
+
+    const { error: fallbackUploadError } = await supabase.storage
+      .from('notarial-documents')
+      .upload(filePath, buffer, {
+        contentType: file.mimeType || file.type || `application/${ext}`,
+        upsert: false,
+      })
+
+    if (fallbackUploadError) {
+      throw new Error(
+        `${uploadError.message || 'Could not upload attachment.'}${rlsHint}`.trim(),
+      )
+    }
+
+    const { data: fallbackUrlData } = supabase.storage
+      .from('notarial-documents')
+      .getPublicUrl(filePath)
+
+    return {
+      url: fallbackUrlData?.publicUrl || filePath,
+      name: originalName || safeName,
+    }
+  }
+
+  const { data: urlData } = supabase.storage
+    .from('appointment-attachments')
+    .getPublicUrl(filePath)
+
+  return {
+    url: urlData?.publicUrl || filePath,
+    name: originalName || safeName,
+  }
+}
+
+/**
+ * Web BookAppointment pre-check — blocks checkout when client already has active appointment(s).
+ */
+export async function assertNoActiveAppointmentForClient(clientId) {
+  if (!clientId) return
+
+  const flag = await getAppConfig('prevent_double_booking', true)
+  const enforce =
+    flag === true ||
+    flag === 'true' ||
+    flag === 1 ||
+    (typeof flag === 'string' && flag.trim().toLowerCase() === 'true')
+
+  if (!enforce) return
+
+  const { data, error } = await supabase
+    .from('appointments')
+    .select('id, status')
+    .eq('client_id', clientId)
+
+  if (error) throw error
+
+  const FINALIZED_STATUSES = new Set(['completed', 'cancelled', 'rejected'])
+  const activeRows = (data || []).filter(
+    (row) => !FINALIZED_STATUSES.has(String(row?.status || '').toLowerCase()),
+  )
+
+  const activeCount = activeRows.length
+  if (activeCount === 0) return
+
+  if (activeCount >= 2) {
+    throw new Error(
+      'You already have two active appointments. Please finish or cancel one before booking again.',
+    )
+  }
+
+  const confirmError = new Error(
+    'You already have an active consultation. Are you sure you want to book another one?',
+  )
+  confirmError.code = 'DOUBLE_BOOKING_NEEDS_CONFIRMATION'
+  throw confirmError
+}
+
 /** Same cap as web BookAppointment (max 2 active per client–attorney). */
 export async function fetchClientAttorneyActiveBookingCount({ clientId, attorneyId }) {
   if (!clientId || !attorneyId) {
@@ -2008,6 +2589,8 @@ export async function createAppointmentBooking({
   paymentMethod,
   paymentCode,
   paymentReference,
+  attachmentUrl,
+  attachmentName,
   payload,
 }) {
   const {
@@ -2043,6 +2626,8 @@ export async function createAppointmentBooking({
     slot_time: payload?.slot_time || null,
     amount: Number(payload?.amount ?? amount ?? 0),
     duration_minutes: Number(payload?.duration_minutes || 60),
+    attachment_url: payload?.attachment_url ?? attachmentUrl ?? null,
+    attachment_name: payload?.attachment_name ?? attachmentName ?? null,
   }
 
   let resolvedSlotId = slotId || payload?.slot_id || null
@@ -2118,15 +2703,19 @@ export async function createAppointmentBooking({
     throw new Error('Missing appointment payload details.')
   }
 
-  const activeBookingCount = await fetchClientAttorneyActiveBookingCount({
-    clientId: resolvedClientId,
-    attorneyId: normalizedPayload.attorney_id,
-  })
+  // Respect the admin "Prevent Multiple Active Bookings" toggle.
+  const doubleBookingFlag = await getAppConfig('prevent_double_booking', true)
+  if (coerceFlag(doubleBookingFlag, true)) {
+    const activeBookingCount = await fetchClientAttorneyActiveBookingCount({
+      clientId: resolvedClientId,
+      attorneyId: normalizedPayload.attorney_id,
+    })
 
-  if (activeBookingCount >= 2) {
-    throw new Error(
-      'Booking limit reached. You can only keep up to 2 active bookings with the same attorney.',
-    )
+    if (activeBookingCount >= 2) {
+      throw new Error(
+        'Booking limit reached. You can only keep up to 2 active bookings with the same attorney.',
+      )
+    }
   }
 
   normalizedPayload.scheduled_at = scheduledIso
@@ -2167,28 +2756,64 @@ export async function createAppointmentBooking({
   }
 
   if (!appointmentId && !rpcSucceeded) {
-    const { data: insertedAppointment, error: fallbackInsertError } = await supabase
+    const insertPayload = {
+      client_id: resolvedClientId,
+      attorney_id: normalizedPayload.attorney_id,
+      slot_id: resolvedSlotId,
+      title: normalizedPayload.title,
+      notes: normalizedPayload.notes,
+      scheduled_at: normalizedPayload.scheduled_at,
+      duration_minutes: normalizedPayload.duration_minutes,
+      amount: normalizedPayload.amount,
+      // 'pending' until PayMongo succeeds — notifyAttorneyOfPaidBooking() sets 'confirmed'.
+      status: 'pending',
+      created_at: nowIso,
+      updated_at: nowIso,
+    }
+    if (normalizedPayload.attachment_url) insertPayload.attachment_url = normalizedPayload.attachment_url
+    if (normalizedPayload.attachment_name) insertPayload.attachment_name = normalizedPayload.attachment_name
+
+    let insertResult = await supabase
       .from('appointments')
-      .insert({
-        client_id: resolvedClientId,
-        attorney_id: normalizedPayload.attorney_id,
-        slot_id: resolvedSlotId,
-        title: normalizedPayload.title,
-        notes: normalizedPayload.notes,
-        scheduled_at: normalizedPayload.scheduled_at,
-        duration_minutes: normalizedPayload.duration_minutes,
-        amount: normalizedPayload.amount,
-        status: 'confirmed',
-        created_at: nowIso,
-        updated_at: nowIso,
-      })
+      .insert(insertPayload)
       .select('id')
       .single()
 
-    if (fallbackInsertError) {
-      throw fallbackInsertError
+    if (
+      insertResult.error &&
+      (isMissingColumnError(insertResult.error, 'attachment_url') ||
+        isMissingColumnError(insertResult.error, 'attachment_name'))
+    ) {
+      const { attachment_url, attachment_name, ...rest } = insertPayload
+      insertResult = await supabase
+        .from('appointments')
+        .insert(rest)
+        .select('id')
+        .single()
     }
-    appointmentId = insertedAppointment?.id || null
+
+    if (insertResult.error) {
+      throw insertResult.error
+    }
+    appointmentId = insertResult.data?.id || null
+  }
+
+  if (appointmentId && (normalizedPayload.attachment_url || normalizedPayload.attachment_name)) {
+    const attachmentPatch = {}
+    if (normalizedPayload.attachment_url) attachmentPatch.attachment_url = normalizedPayload.attachment_url
+    if (normalizedPayload.attachment_name) attachmentPatch.attachment_name = normalizedPayload.attachment_name
+    const { error: attachUpdateError } = await supabase
+      .from('appointments')
+      .update(attachmentPatch)
+      .eq('id', appointmentId)
+
+    if (
+      attachUpdateError &&
+      !isMissingColumnError(attachUpdateError, 'attachment_url') &&
+      !isMissingColumnError(attachUpdateError, 'attachment_name')
+    ) {
+      console.warn('[booking] persist attachment metadata failed', attachUpdateError)
+    }
   }
 
   if (normalizedPayload.slot_date && normalizedPayload.slot_time) {
@@ -2251,7 +2876,7 @@ export async function createAppointmentBooking({
         notes: normalizedPayload.notes,
         duration_minutes: normalizedPayload.duration_minutes,
         amount: normalizedPayload.amount,
-        status: 'confirmed',
+        status: 'pending',
         slot_id: resolvedSlotId,
         updated_at: nowIso,
       })
@@ -2363,17 +2988,18 @@ export async function createAppointmentBooking({
         minute: '2-digit',
       })
 
+      const dedupeMarker = `[appt:${appointmentId}]`
       const { error: notificationError } = await supabase.from('notifications').insert({
         user_id: normalizedPayload.attorney_id,
-        title: 'New Consultation Booking',
-        body: `${rawClientName} booked ${normalizedPayload.title || 'a consultation'} on ${whenLabel}.`,
+        title: 'Pending Consultation Booking',
+        body: `${rawClientName} is booking ${normalizedPayload.title || 'a consultation'} on ${whenLabel}. Waiting for payment. ${dedupeMarker}`,
         type: 'consultation',
         is_read: false,
         created_at: nowIso,
       })
 
       if (notificationError) {
-        console.warn('[booking] failed to create attorney notification', notificationError)
+        console.warn('[booking] failed to create attorney pending notification', notificationError)
       }
 
       const { error: clientBookingNotificationError } = await supabase.from('notifications').insert({
@@ -2405,54 +3031,86 @@ export async function createNotarialRequest({
   notes,
   documentUrl,
   documentName,
+  amount,
 }) {
-  const requestId =
-    globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
   const nowIso = new Date().toISOString()
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('notarial_requests')
     .insert({
-      id: requestId,
       client_id: clientId,
       attorney_id: attorneyId,
       service_type: serviceType,
       preferred_date: preferredDate || null,
       details: details || notes || null,
       document_url: documentUrl || documentName || null,
+      amount: resolveNotarialAmount(amount),
       status: 'pending',
       created_at: nowIso,
       updated_at: nowIso,
     })
+    .select()
+    .single()
 
   if (error) throw error
-  return {
-    id: requestId,
-    client_id: clientId,
-    attorney_id: attorneyId,
-    service_type: serviceType,
-    preferred_date: preferredDate || null,
-    details: details || notes || null,
-    document_url: documentUrl || documentName || null,
-    status: 'pending',
-    created_at: nowIso,
-    updated_at: nowIso,
-  }
+  return data
 }
 
-export async function fetchAttorneyUpcomingAppointments(userId) {
-  const { data, error } = await supabase
+export async function fetchAttorneyUpcomingAppointments(userId, options = {}) {
+  const force = Boolean(options?.force)
+  const nowIso = new Date().toISOString()
+
+  let query = supabase
     .from('appointments')
-    .select('id, title, scheduled_at, status, notes, client:client_id(full_name)')
+    .select(APPOINTMENT_ATTORNEY_LIST_SELECT)
     .eq('attorney_id', userId)
-    .in('status', ['confirmed', 'rescheduled', 'pending'])
+    .in('status', APPOINTMENT_STATUS_UPCOMING)
+    .gte('scheduled_at', nowIso)
     .order('scheduled_at', { ascending: true })
+
+  if (!force) {
+    query = query.limit(120)
+  }
+
+  let { data, error } = await query
+
+  if (error && isMissingColumnError(error, 'attachment_url')) {
+    const fallback = await supabase
+      .from('appointments')
+      .select('id, title, scheduled_at, status, notes, amount, client:client_id(full_name)')
+      .eq('attorney_id', userId)
+      .in('status', APPOINTMENT_STATUS_UPCOMING)
+      .gte('scheduled_at', nowIso)
+      .order('scheduled_at', { ascending: true })
+    data = fallback.data
+    error = fallback.error
+  }
 
   if (error) throw error
 
-  return (data || []).map((item) => {
+  const appointmentIds = (data || []).map((row) => row.id).filter(Boolean)
+  let paidAppointmentIds = new Set()
+  if (appointmentIds.length) {
+    const { data: txRows, error: txError } = await supabase
+      .from('transactions')
+      .select('appointment_id, payment_status')
+      .eq('attorney_id', userId)
+      .in('appointment_id', appointmentIds)
+    if (!txError) {
+      paidAppointmentIds = new Set(
+        (txRows || [])
+          .filter((tx) => String(tx.payment_status || '').toLowerCase() === 'paid')
+          .map((tx) => tx.appointment_id),
+      )
+    }
+  }
+
+  return mapAttorneyUpcomingAppointments(data || [], paidAppointmentIds)
+}
+
+function mapAttorneyUpcomingAppointments(rows, paidAppointmentIds) {
+  const paidIds = paidAppointmentIds || new Set()
+  return (rows || []).map((item) => {
     const dt = new Date(item.scheduled_at)
     const valid = !Number.isNaN(dt.getTime())
     const dateLabel = valid
@@ -2461,6 +3119,9 @@ export async function fetchAttorneyUpcomingAppointments(userId) {
     const timeLabel = valid
       ? dt.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' })
       : 'TBD'
+    const derivedSlot = deriveSlotFieldsFromScheduledAt(item.scheduled_at)
+    const consultationPaid =
+      paidIds.has(item.id) || Number(item.amount || 0) > 0
 
     return {
       id: item.id,
@@ -2475,11 +3136,303 @@ export async function fetchAttorneyUpcomingAppointments(userId) {
       date: dateLabel,
       time: timeLabel,
       scheduledAt: item.scheduled_at,
+      slotDate: item.slot_date || derivedSlot.slotDate,
+      slotTime: item.slot_time || derivedSlot.slotTime,
       status: item.status,
+      paymentStatus: consultationPaid ? 'paid' : 'unpaid',
       color: '#6366f1',
       concern: item.notes || '',
+      attachmentUrl: item.attachment_url || '',
+      attachmentName: item.attachment_name || '',
     }
   })
+}
+
+export async function fetchAttorneyDashboardSnapshot(userId, options = {}) {
+  if (!userId) {
+    return {
+      appointments: [],
+      unreadNotificationCount: 0,
+      pendingRequestCount: 0,
+      upcomingCount: 0,
+      myAppointmentCount: 0,
+    }
+  }
+
+  const nowIso = new Date().toISOString()
+
+  const [appointmentsRes, unreadRes, pendingRes, upcomingCountRes, myCountRes] = await Promise.all([
+    supabase
+      .from('appointments')
+      .select(APPOINTMENT_ATTORNEY_LIST_SELECT)
+      .eq('attorney_id', userId)
+      .in('status', APPOINTMENT_STATUS_UPCOMING)
+      .gte('scheduled_at', nowIso)
+      .order('scheduled_at', { ascending: true })
+      .limit(3),
+    supabase
+      .from('notifications')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .eq('is_read', false),
+    supabase
+      .from('appointments')
+      .select('id', { count: 'exact', head: true })
+      .eq('attorney_id', userId)
+      .eq('status', 'pending'),
+    supabase
+      .from('appointments')
+      .select('id', { count: 'exact', head: true })
+      .eq('attorney_id', userId)
+      .in('status', APPOINTMENT_STATUS_UPCOMING)
+      .gte('scheduled_at', nowIso),
+    supabase
+      .from('appointments')
+      .select('id', { count: 'exact', head: true })
+      .eq('attorney_id', userId)
+      .in('status', APPOINTMENT_STATUS_MY_APPOINTMENTS)
+      .gte('scheduled_at', nowIso),
+  ])
+
+  if (appointmentsRes.error) {
+    if (isMissingColumnError(appointmentsRes.error, 'attachment_url')) {
+      const retry = await supabase
+        .from('appointments')
+        .select('id, title, scheduled_at, status, notes, amount, client:client_id(full_name)')
+        .eq('attorney_id', userId)
+        .in('status', APPOINTMENT_STATUS_UPCOMING)
+        .gte('scheduled_at', nowIso)
+        .order('scheduled_at', { ascending: true })
+        .limit(3)
+      if (retry.error) throw retry.error
+      appointmentsRes.data = retry.data
+      appointmentsRes.error = null
+    } else {
+      throw appointmentsRes.error
+    }
+  }
+  if (unreadRes.error) throw unreadRes.error
+  if (pendingRes.error) throw pendingRes.error
+  if (upcomingCountRes.error) throw upcomingCountRes.error
+  if (myCountRes.error) throw myCountRes.error
+
+  const appointmentIds = (appointmentsRes.data || []).map((row) => row.id).filter(Boolean)
+  let paidAppointmentIds = new Set()
+  if (appointmentIds.length) {
+    const { data: txRows, error: txError } = await supabase
+      .from('transactions')
+      .select('appointment_id, payment_status')
+      .eq('attorney_id', userId)
+      .in('appointment_id', appointmentIds)
+    if (!txError) {
+      paidAppointmentIds = new Set(
+        (txRows || [])
+          .filter((tx) => String(tx.payment_status || '').toLowerCase() === 'paid')
+          .map((tx) => tx.appointment_id),
+      )
+    }
+  }
+
+  return {
+    appointments: mapAttorneyUpcomingAppointments(appointmentsRes.data || [], paidAppointmentIds),
+    unreadNotificationCount: Number(unreadRes.count || 0),
+    pendingRequestCount: Number(pendingRes.count || 0),
+    upcomingCount: Number(upcomingCountRes.count || 0),
+    myAppointmentCount: Number(myCountRes.count || 0),
+  }
+}
+
+export async function fetchAttorneyConsultationLogs(userId, options = {}) {
+  const force = Boolean(options?.force)
+  let query = supabase
+    .from('appointments')
+    .select('id, title, scheduled_at, status, updated_at, client:client_id(full_name)')
+    .eq('attorney_id', userId)
+    .eq('status', 'completed')
+    .order('scheduled_at', { ascending: false })
+
+  if (!force) {
+    query = query.limit(100)
+  }
+
+  const { data, error } = await query
+  if (error) throw error
+
+  return (data || []).map((item) => {
+    const dt = new Date(item.scheduled_at || item.updated_at)
+    const valid = !Number.isNaN(dt.getTime())
+    return {
+      id: item.id,
+      clientName: item.client?.full_name || 'Client',
+      title: item.title || 'Consultation',
+      scheduledAt: item.scheduled_at,
+      dateLabel: valid
+        ? dt.toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })
+        : 'TBD',
+      timeLabel: valid
+        ? dt.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' })
+        : 'TBD',
+      status: String(item.status || '').toLowerCase(),
+    }
+  })
+}
+
+export async function markAttorneyNotificationsAsRead(attorneyId) {
+  if (!attorneyId) return
+  const { error } = await supabase
+    .from('notifications')
+    .update({ is_read: true })
+    .eq('user_id', attorneyId)
+    .eq('is_read', false)
+  if (error) throw error
+}
+
+function createDebouncedRealtimeHandler(callback, delayMs = 400) {
+  let timer = null
+  const schedule = () => {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(() => {
+      timer = null
+      callback?.()
+    }, delayMs)
+  }
+  const dispose = () => {
+    if (timer) clearTimeout(timer)
+    timer = null
+  }
+  return { schedule, dispose }
+}
+
+export function subscribeToClientAppointments(clientId, onChange) {
+  if (!clientId) return () => {}
+
+  const { schedule, dispose } = createDebouncedRealtimeHandler(() => {
+    invalidateClientHomeCache(clientId)
+    onChange?.()
+  })
+
+  const channel = supabase
+    .channel(`client-appointments:${clientId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'appointments',
+        filter: `client_id=eq.${clientId}`,
+      },
+      () => schedule(),
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'transactions',
+        filter: `client_id=eq.${clientId}`,
+      },
+      () => schedule(),
+    )
+    .subscribe()
+
+  return () => {
+    dispose()
+    try {
+      supabase.removeChannel(channel)
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export function subscribeToAttorneyAppointments(attorneyId, onChange) {
+  if (!attorneyId) return () => {}
+  const channel = supabase
+    .channel(`attorney-appointments:${attorneyId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'appointments',
+        filter: `attorney_id=eq.${attorneyId}`,
+      },
+      () => onChange?.(),
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'transactions',
+        filter: `attorney_id=eq.${attorneyId}`,
+      },
+      () => onChange?.(),
+    )
+    .subscribe()
+
+  return () => {
+    try {
+      supabase.removeChannel(channel)
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export function subscribeToAttorneyNotifications(attorneyId, onChange) {
+  if (!attorneyId) return () => {}
+  const channel = supabase
+    .channel(`attorney_notifications_${attorneyId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'notifications',
+        filter: `user_id=eq.${attorneyId}`,
+      },
+      () => onChange?.(),
+    )
+    .subscribe()
+
+  return () => {
+    try {
+      supabase.removeChannel(channel)
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export const getAvailability = fetchAvailability
+
+/** Realtime availability updates (web BookAppointment parity). */
+export function subscribeToAvailabilitySlots(onChange) {
+  const channel = supabase
+    .channel('availability-slots:realtime')
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'availability_slots',
+      },
+      (payload) => {
+        if (typeof onChange === 'function') {
+          onChange(payload)
+        }
+      },
+    )
+    .subscribe()
+
+  return () => {
+    try {
+      supabase.removeChannel(channel)
+    } catch {
+      // ignore
+    }
+  }
 }
 
 export async function rescheduleAttorneyAppointment({ appointmentId, scheduledAt, note }) {
@@ -2532,7 +3485,7 @@ export async function updateAttorneyNotarialRequestStatus({ requestId, status, n
 export async function fetchAttorneyAnnouncementsData(userId) {
   const { data, error } = await supabase
     .from('notifications')
-    .select('id, title, body, type, created_at')
+    .select('id, title, body, type, data, created_at')
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
     .limit(20)
@@ -2547,9 +3500,10 @@ export async function fetchAttorneyAnnouncementsData(userId) {
       id: item.id,
       title: item.title || 'Announcement',
       body: item.body || '',
+      imageUrl: parseNotificationImageUrl(item.data),
       date: valid ? dt.toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' }) : 'Today',
       time: valid ? dt.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' }) : 'Now',
-      author: 'BatasMo Admin',
+      author: 'LegalLink Admin',
       pinned: type.includes('important') || type.includes('admin'),
       tag: type.includes('maintenance') ? 'Maintenance' : type.includes('important') ? 'Important' : 'General',
     }
@@ -2619,7 +3573,7 @@ const isPaidOrFreeConsultation = ({ amount, consultationPaid }) => {
 }
 
 export async function fetchAttorneyConsultationAnalyticsData(userId) {
-  const [apptsRes, paidTxRes] = await Promise.all([
+  const [apptsRes, paidTxRes, profileRes, attorneyRes] = await Promise.all([
     supabase
       .from('appointments')
       .select('id, title, status, scheduled_at, updated_at, amount')
@@ -2629,6 +3583,8 @@ export async function fetchAttorneyConsultationAnalyticsData(userId) {
       .select('appointment_id')
       .eq('attorney_id', userId)
       .eq('payment_status', 'paid'),
+    supabase.from('profiles').select('full_name').eq('id', userId).maybeSingle(),
+    supabase.from('attorney_profiles').select('specialties').eq('user_id', userId).maybeSingle(),
   ])
 
   if (apptsRes.error) throw apptsRes.error
@@ -2638,24 +3594,35 @@ export async function fetchAttorneyConsultationAnalyticsData(userId) {
   const paidTxRows = paidTxRes.data || []
   const paidIds = new Set(paidTxRows.map((r) => r.appointment_id).filter(Boolean))
 
+  const branchOptions = getConsultationBranchesForAttorney({
+    name: profileRes.data?.full_name || '',
+    specialties: normalizeStringArray(attorneyRes.data?.specialties),
+  })
+
   const excludedStatuses = new Set(['rejected', 'cancelled'])
-  const countsByType = new Map()
+  const branchCounts = new Map(branchOptions.map((label) => [label, 0]))
+  let classifiedTotal = 0
+  let total = 0
 
   appointments.forEach((row) => {
     const status = String(row?.status || '').toLowerCase()
     if (excludedStatuses.has(status)) return
+
+    total += 1
     if (!isPaidOrFreeConsultation({ amount: row?.amount, consultationPaid: paidIds.has(row.id) })) return
 
-    const typeLabel = normalizeConsultationTypeLabel(row?.title)
-    countsByType.set(typeLabel, Number(countsByType.get(typeLabel) || 0) + 1)
+    const branch = parseConsultationBranchFromTitle(row?.title)
+    if (!branch || !branchCounts.has(branch)) return
+
+    branchCounts.set(branch, Number(branchCounts.get(branch) || 0) + 1)
+    classifiedTotal += 1
   })
 
-  const rows = Array.from(countsByType.entries())
-    .map(([label, count]) => ({ label, count }))
-    .sort((a, b) => b.count - a.count)
-
-  const total = rows.reduce((sum, item) => sum + Number(item.count || 0), 0)
-  const maxCount = rows.length ? rows[0].count : 0
+  const branchRows = branchOptions.map((label) => ({
+    label,
+    count: Number(branchCounts.get(label) || 0),
+  }))
+  const branchMaxCount = branchRows.reduce((max, row) => Math.max(max, row.count), 0)
 
   const statusCounts = new Map()
   appointments.forEach((row) => {
@@ -2679,35 +3646,17 @@ export async function fetchAttorneyConsultationAnalyticsData(userId) {
     gender = buildGenderAnalyticsWithBaseline([])
   }
 
-  let averageRating = 0
-  let ratingCount = 0
-  try {
-    const fbRes = await supabase
-      .from('consultation_feedback')
-      .select('rating')
-      .eq('attorney_id', userId)
-    if (fbRes.error) throw fbRes.error
-    const ratings = (fbRes.data || [])
-      .map((r) => Number(r?.rating))
-      .filter((n) => Number.isFinite(n) && n >= 1 && n <= 5)
-    ratingCount = ratings.length
-    if (ratingCount) {
-      averageRating = ratings.reduce((sum, n) => sum + n, 0) / ratingCount
-    }
-  } catch (e) {
-    console.warn('[analytics] consultation_feedback rating query failed', e)
-    averageRating = 0
-    ratingCount = 0
-  }
-
   return {
-    rows,
+    rows: branchRows,
     total,
-    maxCount,
-    gender,
+    maxCount: branchMaxCount,
+    branches: {
+      rows: branchRows,
+      total: classifiedTotal,
+      maxCount: branchMaxCount,
+    },
     status,
-    averageRating,
-    ratingCount,
+    gender,
   }
 }
 
@@ -2817,27 +3766,878 @@ export async function fetchAttorneyHomeData(userId) {
   return result
 }
 
-export async function fetchAttorneyProfile(userId) {
+async function fetchAttorneyProfileStats(userId) {
+  const [consultationsRes, notarialRes, paidTxRes] = await Promise.all([
+    supabase.from('appointments').select('id, amount').eq('attorney_id', userId),
+    supabase.from('notarial_requests').select('id').eq('attorney_id', userId),
+    supabase
+      .from('transactions')
+      .select('appointment_id')
+      .eq('attorney_id', userId)
+      .eq('payment_status', 'paid')
+      .not('appointment_id', 'is', null),
+  ])
+
+  if (consultationsRes.error) throw consultationsRes.error
+  if (notarialRes.error) throw notarialRes.error
+  if (paidTxRes.error) throw paidTxRes.error
+
+  const paidIds = new Set((paidTxRes.data || []).map((r) => r.appointment_id).filter(Boolean))
+  const consultationCount = (consultationsRes.data || []).filter((row) =>
+    isPaidOrFreeConsultation({ amount: row?.amount, consultationPaid: paidIds.has(row.id) }),
+  ).length
+
+  return {
+    consultationCount,
+    notarialCount: (notarialRes.data || []).length,
+  }
+}
+
+async function fetchAttorneyProfileCore(userId) {
   const [profileRes, attorneyRes] = await Promise.all([
     supabase
       .from('profiles')
-      .select('*')
+      .select('id, full_name, email, phone, address, avatar_url, role')
       .eq('id', userId)
-      .single(),
+      .maybeSingle(),
     supabase
       .from('attorney_profiles')
-      .select('*')
+      .select('firm_name, years_experience, specialties, bio, consultation_fee, prc_id, is_verified')
       .eq('user_id', userId)
-      .single(),
+      .maybeSingle(),
   ])
 
   if (profileRes.error) throw profileRes.error
-  if (attorneyRes.error && attorneyRes.error.code !== 'PGRST116') throw attorneyRes.error
+  if (attorneyRes.error) throw attorneyRes.error
+
+  const specialties = normalizeStringArray(attorneyRes.data?.specialties)
+  const prior = getCachedAttorneyProfile(userId)
 
   return {
     profile: profileRes.data || {},
     attorney: attorneyRes.data || {},
+    specialties,
+    consultationCount: prior?.consultationCount ?? 0,
+    notarialCount: prior?.notarialCount ?? 0,
   }
+}
+
+/** Cached attorney profile; `includeStats: false` returns after 2 queries (fast paint). */
+export async function fetchAttorneyProfile(userId, options = {}) {
+  const force = Boolean(options?.force)
+  const includeStats = options?.includeStats !== false
+
+  if (!force) {
+    const cached = getCachedAttorneyProfile(userId)
+    if (cached) {
+      if (!includeStats || cached.statsLoaded) return cached
+      const stats = await fetchAttorneyProfileStats(userId)
+      const merged = {...cached, ...stats, statsLoaded: true}
+      setCachedAttorneyProfile(userId, merged)
+      return merged
+    }
+  }
+
+  const core = await fetchAttorneyProfileCore(userId)
+  let result = {...core, statsLoaded: false}
+  setCachedAttorneyProfile(userId, result)
+
+  if (!includeStats) return result
+
+  const stats = await fetchAttorneyProfileStats(userId)
+  result = {...result, ...stats, statsLoaded: true}
+  setCachedAttorneyProfile(userId, result)
+  return result
+}
+
+/** Refresh consultation/notarial counts without reloading profile rows. */
+export function prefetchAttorneyProfileStats(userId) {
+  if (!userId) return Promise.resolve(null)
+  return fetchAttorneyProfileStats(userId)
+    .then((stats) => {
+      const cached = getCachedAttorneyProfile(userId) || {}
+      const merged = {...cached, ...stats, statsLoaded: true}
+      setCachedAttorneyProfile(userId, merged)
+      return merged
+    })
+    .catch(() => null)
+}
+
+/**
+ * @param {string} appointmentId
+ * @param {{ includeMessages?: boolean }} [options] — set includeMessages: false for summary-only views
+ */
+export async function fetchConsultationTranscriptForAppointment(appointmentId, options = {}) {
+  const includeMessages = options.includeMessages !== false
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  if (!user) throw new Error('Not authenticated')
+  if (!appointmentId) throw new Error('Appointment is required.')
+
+  let appointment = null
+  let appointmentError = null
+  const richAppointmentRes = await supabase
+    .from('appointments')
+    .select('id, attorney_id, client_id, attorney_consultation_summary, title')
+    .eq('id', appointmentId)
+    .maybeSingle()
+
+  if (richAppointmentRes.error && isMissingColumnError(richAppointmentRes.error, 'attorney_consultation_summary')) {
+    const minAppointmentRes = await supabase
+      .from('appointments')
+      .select('id, attorney_id, client_id, title')
+      .eq('id', appointmentId)
+      .maybeSingle()
+    appointment = minAppointmentRes.data || null
+    appointmentError = minAppointmentRes.error || null
+  } else {
+    appointment = richAppointmentRes.data || null
+    appointmentError = richAppointmentRes.error || null
+  }
+
+  if (appointmentError) throw new Error(appointmentError.message)
+  if (!appointment) throw new Error('Appointment not found.')
+
+  const canView =
+    String(user.id) === String(appointment.attorney_id) ||
+    String(user.id) === String(appointment.client_id)
+
+  if (!canView) {
+    throw new Error('You do not have access to this transcript.')
+  }
+
+  const roomSelect = includeMessages
+    ? `
+      id,
+      is_closed,
+      messages (
+        id,
+        sender_id,
+        message,
+        message_type,
+        file_bucket,
+        file_path,
+        file_name,
+        mime_type,
+        file_size_bytes,
+        created_at,
+        sender:sender_id(full_name)
+      )
+    `
+    : 'id, is_closed'
+
+  const { data, error } = await supabase
+    .from('consultation_rooms')
+    .select(roomSelect)
+    .eq('appointment_id', appointmentId)
+    .maybeSingle()
+
+  if (error) throw new Error(error.message)
+
+  const attorneyConsultationSummary = String(appointment.attorney_consultation_summary || '')
+
+  if (!includeMessages) {
+    return {
+      messages: [],
+      isClosed: Boolean(data?.is_closed),
+      roomId: data?.id ?? null,
+      attorneyConsultationSummary,
+      title: appointment.title || '',
+    }
+  }
+
+  if (!data?.id) {
+    return {
+      messages: [],
+      isClosed: true,
+      roomId: null,
+      attorneyConsultationSummary,
+      title: appointment.title || '',
+    }
+  }
+
+  const sorted = (data.messages || [])
+    .slice()
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+
+  const messages = sorted.map((row) => {
+    const isMe = String(row.sender_id) === String(user.id)
+    const dt = new Date(row.created_at)
+    return {
+      id: row.id,
+      sender: isMe ? 'me' : 'them',
+      text: row.message || '',
+      message_type: row.message_type || 'text',
+      file_bucket: row.file_bucket,
+      file_path: row.file_path,
+      file_name: row.file_name,
+      mime_type: row.mime_type,
+      time: Number.isNaN(dt.getTime())
+        ? ''
+        : dt.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' }),
+    }
+  })
+
+  return {
+    messages,
+    isClosed: Boolean(data.is_closed),
+    roomId: data.id,
+    attorneyConsultationSummary,
+    title: appointment.title || '',
+  }
+}
+
+// Admin-controlled feature flags backed by public.app_config (Supabase).
+// We keep an in-memory cache so reads are instant after the first warmup,
+// and a single realtime subscription keeps the cache in sync when an admin
+// toggles a value in the Settings page.
+
+const APP_CONFIG_KNOWN_KEYS = ['prevent_double_booking', 'enforce_schedule_window']
+const APP_CONFIG_LOAD_TIMEOUT_MS = 8000
+const appConfigCache = new Map()
+let appConfigLoadPromise = null
+let appConfigChannel = null
+
+const withAppConfigTimeout = (promise, label) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error(`${label} timed out after ${APP_CONFIG_LOAD_TIMEOUT_MS}ms`)),
+        APP_CONFIG_LOAD_TIMEOUT_MS,
+      )
+    }),
+  ])
+
+// Coerces typical Postgres jsonb representations (true/false, "true"/"false",
+// 1/0) into a strict boolean. Used by the admin toggles.
+const coerceFlag = (value, fallback = true) => {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (normalized === 'true' || normalized === '1') return true
+    if (normalized === 'false' || normalized === '0') return false
+  }
+  return fallback
+}
+
+// Synchronous, cache-only read of an admin feature flag.
+export const isAppConfigFlagOn = (key, fallback = true) => {
+  if (!appConfigCache.has(key)) return fallback
+  return coerceFlag(appConfigCache.get(key), fallback)
+}
+
+const fetchAppConfigValue = async (key) => {
+  const { data, error } = await supabase.rpc('get_app_config', { p_key: key })
+  if (!error) return data ?? null
+
+  const isMissingFunction =
+    error?.code === '42883' ||
+    String(error?.message || '').toLowerCase().includes('does not exist')
+  if (!isMissingFunction) throw error
+
+  const { data: row, error: tableError } = await supabase
+    .from('app_config')
+    .select('value')
+    .eq('key', key)
+    .maybeSingle()
+  if (tableError) throw tableError
+  return row?.value ?? null
+}
+
+// Pre-fetches the known feature flags into the cache.
+export function ensureAppConfigLoaded() {
+  if (appConfigLoadPromise) return appConfigLoadPromise
+
+  appConfigLoadPromise = (async () => {
+    await Promise.all(
+      APP_CONFIG_KNOWN_KEYS.map(async (key) => {
+        try {
+          const value = await withAppConfigTimeout(
+            fetchAppConfigValue(key),
+            `app_config:${key}`,
+          )
+          appConfigCache.set(key, value)
+        } catch (err) {
+          console.warn(`[app_config] failed to warm "${key}":`, err?.message || err)
+        }
+      }),
+    )
+  })()
+
+  appConfigLoadPromise.finally(() => {
+    appConfigLoadPromise = null
+  })
+
+  return appConfigLoadPromise
+}
+
+// Subscribes once to changes on public.app_config so the cache stays current.
+export function subscribeToAppConfigChanges() {
+  if (appConfigChannel) return appConfigChannel
+
+  try {
+    appConfigChannel = supabase
+      .channel('app_config_changes')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'app_config' },
+        (payload) => {
+          const row = payload?.new || payload?.old
+          if (!row?.key) return
+          if (payload?.eventType === 'DELETE') {
+            appConfigCache.delete(row.key)
+          } else {
+            appConfigCache.set(row.key, row.value ?? null)
+          }
+        },
+      )
+      .subscribe()
+  } catch (err) {
+    console.warn('[app_config] realtime subscribe failed:', err?.message || err)
+    appConfigChannel = null
+  }
+
+  return appConfigChannel
+}
+
+// Reads a single key from public.app_config.
+export async function getAppConfig(key, fallbackValue = null) {
+  if (!key) return fallbackValue
+
+  if (appConfigCache.has(key)) {
+    const cached = appConfigCache.get(key)
+    return cached === null || cached === undefined ? fallbackValue : cached
+  }
+
+  try {
+    const value = await fetchAppConfigValue(key)
+    appConfigCache.set(key, value)
+    return value === null || value === undefined ? fallbackValue : value
+  } catch (err) {
+    console.warn(`[app_config] getAppConfig("${key}") failed:`, err?.message || err)
+    return fallbackValue
+  }
+}
+
+// Writes a single key in public.app_config via the set_app_config RPC.
+export async function setAppConfig(key, value) {
+  if (!key) throw new Error('setAppConfig requires a key')
+
+  const { data, error } = await supabase.rpc('set_app_config', {
+    p_key: key,
+    p_value: value,
+  })
+  if (error) throw error
+
+  appConfigCache.set(key, data ?? value)
+  return data
+}
+
+// ─── Client-led reschedule (pending admin approval — matches web) ─────────────
+
+const RESCHEDULE_PENDING_PIPE_RE =
+  /\[RESCHEDULE_PENDING\|([^|\]]+)\|([^\]]*)\]/i
+const RESCHEDULE_PENDING_LEGACY_RE = /\[RESCHEDULE_PENDING:[^\]]+\]/i
+const RESCHEDULE_PENDING_ISO_TAIL_RE =
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z):?(.*)$/i
+
+const decodeRescheduleReason = (raw) => {
+  const trimmed = String(raw || '').trim()
+  if (!trimmed) return ''
+  try {
+    return decodeURIComponent(trimmed)
+  } catch {
+    return trimmed
+  }
+}
+
+const isGarbageRescheduleReason = (reason) => {
+  const text = String(reason || '').trim()
+  if (!text) return true
+  if (/^\d{2}:\d{2}/.test(text)) return true
+  if (/^\d{4}-\d{2}-\d{2}T/.test(text)) return true
+  if (/^00:00\.000Z:?$/i.test(text)) return true
+  return false
+}
+
+export function parseReschedulePendingFromNotes(notes) {
+  const text = String(notes || '')
+
+  const pipeMatch = text.match(RESCHEDULE_PENDING_PIPE_RE)
+  if (pipeMatch) {
+    const requestedScheduledAt = String(pipeMatch[1] || '').trim()
+    if (!requestedScheduledAt) return null
+    const reason = decodeRescheduleReason(pipeMatch[2])
+    return {
+      requestedScheduledAt,
+      reason: isGarbageRescheduleReason(reason) ? '' : reason,
+    }
+  }
+
+  const legacyMatch = text.match(RESCHEDULE_PENDING_LEGACY_RE)
+  if (!legacyMatch) return null
+
+  const inner = legacyMatch[0]
+    .replace(/^\[RESCHEDULE_PENDING:/i, '')
+    .replace(/\]$/, '')
+
+  const isoTail = inner.match(RESCHEDULE_PENDING_ISO_TAIL_RE)
+  if (isoTail) {
+    const requestedScheduledAt = String(isoTail[1] || '').trim()
+    const reason = decodeRescheduleReason(isoTail[2])
+    return {
+      requestedScheduledAt,
+      reason: isGarbageRescheduleReason(reason) ? '' : reason,
+    }
+  }
+
+  return null
+}
+
+export function stripReschedulePendingMarker(notes) {
+  return String(notes || '')
+    .replace(RESCHEDULE_PENDING_PIPE_RE, '')
+    .replace(RESCHEDULE_PENDING_LEGACY_RE, '')
+    .replace(/\n{2,}/g, '\n')
+    .trim()
+}
+
+export function buildReschedulePendingNotes(existingNotes, { scheduledAt, reason }) {
+  const base = stripReschedulePendingMarker(existingNotes)
+  const encodedReason = encodeURIComponent(String(reason || '').slice(0, 500))
+  const marker = `[RESCHEDULE_PENDING|${scheduledAt}|${encodedReason}]`
+  return base ? `${base}\n${marker}` : marker
+}
+
+const formatScheduleLabelFromIso = (iso) => {
+  const parsed = iso ? new Date(iso) : null
+  if (!parsed || Number.isNaN(parsed.getTime())) return 'a new schedule'
+  return parsed.toLocaleString('en-PH', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
+const phDateKeyFromIso = (iso) =>
+  new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Manila',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(iso))
+
+const phTimeLabelFromIso = (iso) =>
+  new Date(iso).toLocaleTimeString('en-US', {
+    timeZone: 'Asia/Manila',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  })
+
+function invalidateAvailabilityCache(attorneyId, _dateKey) {
+  if (attorneyId) {
+    attorneyHomeCache.delete(attorneyId)
+  }
+}
+
+function invalidateAttorneyAppointmentsCache(attorneyId) {
+  if (attorneyId) {
+    attorneyHomeCache.delete(attorneyId)
+  }
+}
+
+async function notifyAdminsWithBodyMarker({ title, body, type = 'admin_general', marker }) {
+  if (!marker) return
+  const adminIds = await fetchAdminUserIds()
+  for (const uid of adminIds) {
+    try {
+      const { data: existing } = await supabase
+        .from('notifications')
+        .select('id')
+        .eq('user_id', uid)
+        .ilike('body', `%${marker}%`)
+        .limit(1)
+      if (existing?.length) continue
+      await insertNotificationsForUserIds([uid], {
+        title,
+        body: `${body} ${marker}`.trim(),
+        type,
+      })
+    } catch (e) {
+      console.warn('[notify] admin marker notify failed', e)
+    }
+  }
+}
+
+export async function findAttorneyAvailabilitySlotId(attorneyId, scheduledAtIso) {
+  if (!attorneyId || !scheduledAtIso) return null
+  const dateKey = phDateKeyFromIso(scheduledAtIso)
+  const targetLabel = phTimeLabelFromIso(scheduledAtIso)
+  const targetMs = new Date(scheduledAtIso).getTime()
+
+  const { data, error } = await supabase
+    .from('availability_slots')
+    .select('id, date, time, is_booked')
+    .eq('attorney_id', attorneyId)
+    .eq('date', dateKey)
+    .eq('is_booked', false)
+
+  if (error) throw error
+
+  const rows = data || []
+  const byLabel = rows.find((row) => String(row.time || '').trim() === targetLabel)
+  if (byLabel?.id) return byLabel.id
+
+  const byParse = rows.find((row) => {
+    const parsed = parseSlotDateTime(row.date, row.time)
+    return parsed && parsed.getTime() === targetMs
+  })
+  return byParse?.id || null
+}
+
+export async function rescheduleClientAppointment({ appointmentId, scheduledAt, note }) {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+  if (!user?.id) throw new Error('Not authenticated.')
+
+  const { data: appt, error: fetchErr } = await supabase
+    .from('appointments')
+    .select('id, client_id, attorney_id, title, scheduled_at, status, amount, notes')
+    .eq('id', appointmentId)
+    .maybeSingle()
+
+  if (fetchErr) throw fetchErr
+  if (!appt) throw new Error('Appointment not found.')
+  if (String(appt.client_id) !== String(user.id)) {
+    throw new Error('You can only reschedule your own appointments.')
+  }
+
+  const rawStatus = String(appt.status || '').toLowerCase()
+  if (rawStatus === 'completed' || rawStatus === 'cancelled' || rawStatus === 'rejected') {
+    throw new Error('This appointment can no longer be rescheduled.')
+  }
+  if (rawStatus === 'rescheduled') {
+    throw new Error('This appointment was already rescheduled once. Contact admin for further changes.')
+  }
+
+  if (parseReschedulePendingFromNotes(appt.notes)) {
+    throw new Error('You already have a reschedule request waiting for admin approval.')
+  }
+
+  const schedDate = appt.scheduled_at ? new Date(appt.scheduled_at) : null
+  if (!schedDate || Number.isNaN(schedDate.getTime())) throw new Error('Invalid appointment schedule.')
+  if (schedDate.getTime() - Date.now() <= 0) {
+    throw new Error('This consultation date has already passed.')
+  }
+
+  const phDateKey = (date) =>
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Manila',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(date)
+  const todayKey = phDateKey(new Date())
+  const consultationKey = phDateKey(schedDate)
+  if (consultationKey <= todayKey) {
+    throw new Error(
+      'Reschedule must be done at least 1 day before the consultation date — not on the same day.',
+    )
+  }
+
+  const amount = Number(appt.amount || 0)
+  if (amount > 0) {
+    const { data: txs, error: txErr } = await supabase
+      .from('transactions')
+      .select('payment_status')
+      .eq('appointment_id', appointmentId)
+    if (txErr) throw txErr
+    const paid = (txs || []).some((t) => String(t.payment_status || '').toLowerCase() === 'paid')
+    if (!paid) {
+      throw new Error('Pay your consultation fee first before rescheduling.')
+    }
+  }
+
+  const slotId = await findAttorneyAvailabilitySlotId(appt.attorney_id, scheduledAt)
+  if (!slotId) {
+    throw new Error('That time slot is no longer available. Please pick another date or time.')
+  }
+
+  const nowIso = new Date().toISOString()
+  const nextNotes = buildReschedulePendingNotes(appt.notes, {
+    scheduledAt,
+    reason: note,
+  })
+
+  const { error: updateErr } = await supabase
+    .from('appointments')
+    .update({ notes: nextNotes, updated_at: nowIso })
+    .eq('id', appointmentId)
+
+  if (updateErr) throw updateErr
+
+  invalidateAvailabilityCache(appt.attorney_id, phDateKeyFromIso(scheduledAt))
+  invalidateClientHomeCache(appt.client_id)
+
+  try {
+    const clientName = await resolveClientDisplayName(appt.client_id)
+    const whenLabel = formatScheduleLabelFromIso(scheduledAt)
+    const currentLabel = formatScheduleLabelFromIso(appt.scheduled_at)
+
+    await notifyAdminsWithBodyMarker({
+      title: 'Reschedule approval needed',
+      body: `${clientName} requested to move ${appt.title || 'a consultation'} from ${currentLabel} to ${whenLabel}. Review and accept in Admin Dashboard.`,
+      type: 'reschedule_request',
+      marker: `[reschedreq:${appointmentId}:${String(scheduledAt || '').slice(0, 24)}]`,
+    })
+
+    if (appt.client_id) {
+      await supabase.from('notifications').insert({
+        user_id: appt.client_id,
+        title: 'Reschedule request submitted',
+        body: `Your request to move this consultation to ${whenLabel} was sent to LegalLink Admin for approval.`,
+        type: 'reschedule',
+        is_read: false,
+        created_at: nowIso,
+      })
+    }
+  } catch (notifyError) {
+    console.warn('[reschedule] notify step failed', notifyError)
+  }
+}
+
+export async function adminRescheduleAppointment({ appointmentId, newSlotId }) {
+  const { resolvePaymentBackendUrl } = await import('./paymentApiClient')
+  const session = (await supabase.auth.getSession())?.data?.session
+  if (session?.access_token) {
+    try {
+      const baseUrl = resolvePaymentBackendUrl()
+      const response = await fetch(`${baseUrl}/admin/appointments/reschedule`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ appointmentId, newSlotId }),
+      })
+      const payload = await response.json().catch(() => ({}))
+      if (response.ok) {
+        return {
+          newScheduledIso: payload.newScheduledIso,
+          slotId: payload.slotId,
+        }
+      }
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(payload?.error || payload?.message || 'Not authorized to reschedule.')
+      }
+      console.warn('[admin-schedule] backend reschedule HTTP', response.status, payload?.error || payload)
+    } catch (e) {
+      if (e?.message && (e.message.includes('Not authorized') || e.message.includes('Invalid session'))) {
+        throw e
+      }
+      console.warn('[admin-schedule] backend reschedule request failed, using direct Supabase', e?.message || e)
+    }
+  }
+
+  if (!appointmentId) throw new Error('appointmentId required')
+  if (!newSlotId) throw new Error('newSlotId required')
+
+  const { data: appt, error: apptErr } = await supabase
+    .from('appointments')
+    .select('id, attorney_id, client_id, title, slot_id, slot_date, slot_time, scheduled_at, status')
+    .eq('id', appointmentId)
+    .maybeSingle()
+  if (apptErr) throw apptErr
+  if (!appt) throw new Error('Appointment not found.')
+
+  const { data: newSlot, error: newSlotErr } = await supabase
+    .from('availability_slots')
+    .select('*')
+    .eq('id', newSlotId)
+    .maybeSingle()
+  if (newSlotErr) throw newSlotErr
+  if (!newSlot) throw new Error('Selected slot no longer exists.')
+  if (newSlot.is_booked) throw new Error('Selected slot is already booked.')
+  if (appt.attorney_id && newSlot.attorney_id && appt.attorney_id !== newSlot.attorney_id) {
+    throw new Error('Selected slot belongs to a different attorney than this appointment.')
+  }
+
+  let parsedStart = parseSlotDateTime(newSlot.date, newSlot.time)
+  if (!parsedStart && newSlot.start_time) {
+    const d = new Date(newSlot.start_time)
+    parsedStart = Number.isNaN(d.getTime()) ? null : d
+  }
+  if (!parsedStart) throw new Error('Selected slot has invalid date/time.')
+  const newScheduledIso = parsedStart.toISOString()
+  const nowIso = new Date().toISOString()
+
+  const slotDateForUpdate =
+    newSlot.date || (newSlot.start_time ? newScheduledIso.slice(0, 10) : null)
+  const slotTimeForUpdate =
+    newSlot.time ||
+    (newSlot.start_time ? formatSlotTimeFromDate(new Date(newSlot.start_time)) : null)
+
+  let oldSlotIdToFree = appt.slot_id || null
+  if (!oldSlotIdToFree && appt.attorney_id && appt.slot_date && appt.slot_time) {
+    const { data: candidates } = await supabase
+      .from('availability_slots')
+      .select('id, time')
+      .eq('attorney_id', appt.attorney_id)
+      .eq('date', appt.slot_date)
+    if (Array.isArray(candidates) && candidates.length) {
+      const targetMs = parseSlotDateTime(appt.slot_date, appt.slot_time)?.getTime() || 0
+      const match = candidates.find((row) => {
+        const parsed = parseSlotDateTime(appt.slot_date, row.time)
+        return parsed && parsed.getTime() === targetMs
+      })
+      oldSlotIdToFree = match?.id || null
+    }
+  }
+  if (oldSlotIdToFree && oldSlotIdToFree !== newSlot.id) {
+    const { error: freeErr } = await supabase
+      .from('availability_slots')
+      .update({ is_booked: false, updated_at: nowIso })
+      .eq('id', oldSlotIdToFree)
+    if (freeErr) console.warn('[admin-schedule] free old slot failed', freeErr)
+  }
+
+  const { error: bookErr } = await supabase
+    .from('availability_slots')
+    .update({ is_booked: true, updated_at: nowIso })
+    .eq('id', newSlot.id)
+    .eq('is_booked', false)
+  if (bookErr) {
+    console.warn('[admin-schedule] new slot booking failed', bookErr)
+    throw new Error('Failed to reserve the new slot. It may have just been booked.')
+  }
+
+  const richUpdate = {
+    scheduled_at: newScheduledIso,
+    slot_id: newSlot.id,
+    slot_date: slotDateForUpdate,
+    slot_time: slotTimeForUpdate,
+    status: 'rescheduled',
+    updated_at: nowIso,
+  }
+
+  let { error: updateErr } = await supabase
+    .from('appointments')
+    .update(richUpdate)
+    .eq('id', appointmentId)
+
+  if (updateErr) {
+    console.warn('[admin-schedule] full update failed, retrying minimal', updateErr)
+    const minimalUpdate = {
+      scheduled_at: newScheduledIso,
+      status: 'rescheduled',
+      updated_at: nowIso,
+    }
+    const retry = await supabase.from('appointments').update(minimalUpdate).eq('id', appointmentId)
+    if (retry.error) {
+      await supabase
+        .from('availability_slots')
+        .update({ is_booked: false, updated_at: nowIso })
+        .eq('id', newSlot.id)
+      throw retry.error
+    }
+  }
+
+  invalidateAvailabilityCache(appt.attorney_id, appt.slot_date)
+  invalidateAvailabilityCache(newSlot.attorney_id || appt.attorney_id, newSlot.date || slotDateForUpdate)
+  invalidateAttorneyAppointmentsCache(appt.attorney_id)
+  invalidateClientHomeCache(appt.client_id)
+
+  return { newScheduledIso, slotId: newSlot.id }
+}
+
+export async function acceptClientRescheduleRequest({ appointmentId }) {
+  if (!appointmentId) throw new Error('appointmentId is required.')
+
+  const { data: appt, error: fetchErr } = await supabase
+    .from('appointments')
+    .select('id, notes, attorney_id, client_id, title, scheduled_at')
+    .eq('id', appointmentId)
+    .maybeSingle()
+
+  if (fetchErr) throw fetchErr
+  if (!appt) throw new Error('Appointment not found.')
+
+  const pending = parseReschedulePendingFromNotes(appt.notes)
+  if (!pending?.requestedScheduledAt) {
+    throw new Error('No pending reschedule request found for this appointment.')
+  }
+
+  const newSlotId = await findAttorneyAvailabilitySlotId(appt.attorney_id, pending.requestedScheduledAt)
+  if (!newSlotId) {
+    throw new Error('The requested time slot is no longer available. Ask the client to pick another slot.')
+  }
+
+  await adminRescheduleAppointment({ appointmentId, newSlotId })
+
+  const cleanedNotes = stripReschedulePendingMarker(appt.notes)
+  const reasonLine = pending.reason ? `Client reason: ${pending.reason}` : ''
+  const finalNotes = [cleanedNotes, reasonLine].filter(Boolean).join('\n').trim()
+
+  await supabase
+    .from('appointments')
+    .update({
+      notes: finalNotes || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', appointmentId)
+
+  return { requestedScheduledAt: pending.requestedScheduledAt, newSlotId }
+}
+
+export async function rejectClientRescheduleRequest({ appointmentId, adminNote }) {
+  if (!appointmentId) throw new Error('appointmentId is required.')
+
+  const { data: appt, error: fetchErr } = await supabase
+    .from('appointments')
+    .select('id, notes, client_id, title, scheduled_at')
+    .eq('id', appointmentId)
+    .maybeSingle()
+
+  if (fetchErr) throw fetchErr
+  if (!appt) throw new Error('Appointment not found.')
+
+  const pending = parseReschedulePendingFromNotes(appt.notes)
+  if (!pending) throw new Error('No pending reschedule request found for this appointment.')
+
+  const cleanedNotes = stripReschedulePendingMarker(appt.notes)
+  const nowIso = new Date().toISOString()
+
+  await supabase
+    .from('appointments')
+    .update({ notes: cleanedNotes || null, updated_at: nowIso })
+    .eq('id', appointmentId)
+
+  if (appt.client_id) {
+    const whenLabel = formatScheduleLabelFromIso(pending.requestedScheduledAt)
+    const body = adminNote?.trim()
+      ? `Your reschedule request for ${whenLabel} was declined. ${adminNote.trim()}`
+      : `Your reschedule request for ${whenLabel} was declined. Your original schedule stays in place.`
+
+    await supabase.from('notifications').insert({
+      user_id: appt.client_id,
+      title: 'Reschedule request declined',
+      body,
+      type: 'reschedule',
+      is_read: false,
+      created_at: nowIso,
+    })
+  }
+
+  invalidateClientHomeCache(appt.client_id)
+  return { ok: true }
 }
 
 // Mobile-to-web compatibility aliases: keeps backend calls consistent across both app variants.
@@ -2858,3 +4658,171 @@ export const getMyAppointments = fetchClientAppointmentsData
 export const rescheduleAppointment = requestAppointmentReschedule
 export const getNotarialRequests = fetchClientNotarialRequests
 export const updateNotarialRequestStatus = updateAttorneyNotarialRequestStatus
+
+export {
+  isOngoingVideoCallRoom,
+  countOngoingVideoCallRooms,
+  getConsultationSessionStatus,
+  getQueueRequestDisplayStatus,
+} from './consultationStatus'
+
+/**
+ * Admin announcements (web AdminReports parity). Use from an admin screen when added.
+ */
+export async function sendAdminAnnouncement({
+  title,
+  body,
+  imageUrl,
+  targetClientIds,
+  type = 'announcement',
+}) {
+  const trimmedTitle = String(title || '').trim()
+  const trimmedBody = String(body || '').trim()
+  const trimmedImage = String(imageUrl || '').trim()
+
+  if (!trimmedTitle) throw new Error('Title is required.')
+  if (!trimmedBody && !trimmedImage) {
+    throw new Error('Add a message, an image, or both.')
+  }
+  const ids = (targetClientIds || []).map((id) => String(id).trim()).filter(Boolean)
+  if (!ids.length) throw new Error('Select at least one client recipient.')
+
+  const nowIso = new Date().toISOString()
+  const notificationData = trimmedImage ? { image_url: trimmedImage } : {}
+  const annType = String(type || 'announcement').toLowerCase()
+
+  const payload = ids.map((clientId) => ({
+    user_id: clientId,
+    title: trimmedTitle,
+    body: trimmedBody || (trimmedImage ? 'See attached announcement image.' : ''),
+    type: annType,
+    is_read: false,
+    created_at: nowIso,
+    data: notificationData,
+  }))
+
+  const { error } = await supabase.from('notifications').insert(payload)
+  if (error) throw error
+  return { sent: payload.length }
+}
+
+// ============================================================================
+// CALENDAR AVAILABILITY — ported from Web ClientAvailabilityCalendar
+// ============================================================================
+
+/**
+ * Fetches a per-day availability summary for the given attorney and month.
+ * Returns an object keyed by date string (YYYY-MM-DD), each value:
+ *   { open: number, booked: number, total: number }
+ *
+ * Mirrors Web `fetchClientAttorneyAvailabilityCalendar` (Web userApi.js).
+ */
+export async function fetchClientAttorneyAvailabilityCalendar(attorneyId, monthCursor) {
+  if (!attorneyId || !monthCursor) return {};
+
+  const year = monthCursor.getFullYear();
+  const month = monthCursor.getMonth();
+  const monthStart = toDateKey(new Date(year, month, 1));
+  const monthEnd = toDateKey(new Date(year, month + 1, 0));
+  const today = getTodayDateKey();
+  const fromDate = monthStart < today ? today : monthStart;
+
+  if (fromDate > monthEnd) return {};
+
+  const { data, error } = await supabase.rpc('get_attorney_availability_by_day', {
+    p_attorney_id: attorneyId,
+    p_from_date: fromDate,
+    p_to_date: monthEnd,
+  });
+
+  const isMissingRpc =
+    error?.code === '42883' ||
+    String(error?.message || '').toLowerCase().includes('does not exist');
+
+  if (!error && Array.isArray(data)) {
+    return data.reduce((acc, row) => {
+      const key = String(row.slot_date || '').slice(0, 10);
+      if (!key) return acc;
+      acc[key] = {
+        open: Number(row.open_count) || 0,
+        booked: Number(row.booked_count) || 0,
+        total: Number(row.total_count) || 0,
+      };
+      return acc;
+    }, {});
+  }
+
+  if (!isMissingRpc && error) throw error;
+
+  // Fallback: query availability_slots directly and count open slots per date
+  const { data: slotsData, error: slotsError } = await supabase
+    .from('availability_slots')
+    .select('date, is_booked')
+    .eq('attorney_id', attorneyId)
+    .gte('date', fromDate)
+    .lte('date', monthEnd);
+
+  if (slotsError) return {};
+
+  const byDate = {};
+  (slotsData || []).forEach((slot) => {
+    const key = String(slot.date || '').trim().slice(0, 10);
+    if (!key) return;
+    if (!byDate[key]) byDate[key] = { open: 0, booked: 0, total: 0 };
+    byDate[key].total += 1;
+    if (slot.is_booked) {
+      byDate[key].booked += 1;
+    } else {
+      byDate[key].open += 1;
+    }
+  });
+  return byDate;
+}
+
+/**
+ * Pure helper — derives calendar day status from summary object.
+ * Returns: 'past' | 'no_schedule' | 'available' | 'fully_booked'
+ *
+ * Mirrors Web `getClientDayAvailabilityStatus` (Web userApi.js).
+ */
+export const getClientDayAvailabilityStatus = (dateKey, summary, todayKey = getTodayDateKey()) => {
+  if (!dateKey || dateKey < todayKey) return 'past';
+  const row = summary?.[dateKey];
+  if (!row || row.total <= 0) return 'no_schedule';
+  if (row.open > 0) return 'available';
+  return 'fully_booked';
+};
+
+// ============================================================================
+// NOTARIAL PAYMENT — markNotarialRequestPaid (ported from Web)
+// ============================================================================
+
+/**
+ * Marks a notarial request as paid after a successful bundled checkout.
+ * Must insert a `transactions` row — Client Notary Status reads payment from
+ * transactions.payment_status, not notarial_requests.status alone.
+ */
+export async function markNotarialRequestPaid({
+  requestId,
+  clientId,
+  attorneyId,
+  amount,
+  method,
+}) {
+  if (!requestId || !clientId) return null;
+
+  try {
+    // Reuse standalone notarial payment path so Notary Status shows PAID.
+    return await payForNotarialRequest({
+      requestId,
+      clientId,
+      attorneyId: attorneyId || null,
+      amount: Number(amount || 0),
+      method: method || 'qrph',
+    });
+  } catch (error) {
+    console.warn('[notarial] markNotarialRequestPaid failed', error?.message || error);
+    throw error;
+  }
+}
+

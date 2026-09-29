@@ -10,7 +10,6 @@ import {
   Alert,
   ActivityIndicator,
   Keyboard,
-  Modal,
 } from 'react-native';
 import {useFocusEffect} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
@@ -29,10 +28,10 @@ import {
   getThreadMessages,
 } from '../services/chatService';
 import {
-  hasFeedbackForAppointment,
-  submitConsultationFeedback,
-} from '../services/consultationFeedbackService';
-import {getAppointmentConsultationMeta} from '../services/appointmentService';
+  CHAT_DOCUMENT_PICKER_TYPES,
+  isBlockedChatAttachment,
+} from '../services/chatTypes';
+import {getAppointmentConsultationMeta, getMyAppointments} from '../services/appointmentService';
 import {
   getConsultationSessionBounds,
   getConsultationTimerDisplay,
@@ -42,43 +41,161 @@ import {
   cancelConsultationSessionNotifications,
 } from '../services/consultationSessionNotifications';
 import {ConsultationSessionAlerts} from '../components/ConsultationSessionBar';
-import {getOrCreateVideoMeeting} from '../services/videoMeetingService';
+import {
+  getOrCreateVideoMeeting,
+  getVideoSdkToken,
+} from '../services/videoMeetingService';
+import {ensureAppConfigLoaded, getCurrentSessionProfile} from '../services/userApi';
+import {useUserProfile} from '../context/UserProfileContext';
+import {
+  attachConsultationChatPresence,
+  dismissConsultationPeerEntry,
+} from '../services/consultationChatPresence';
+import ConsultationWaitingPopup from '../components/ConsultationWaitingPopup';
+import {useNotifications} from '../context/NotificationContext';
 
 const ConsultationChat = ({navigation, route}) => {
   const insets = useSafeAreaInsets();
   const [messageText, setMessageText] = useState('');
   const [messages, setMessages] = useState([]);
-  const [isClosed, setIsClosed] = useState(false);
+  const [isClosed, setIsClosed] = useState(null);
   const [sending, setSending] = useState(false);
-  const [feedbackModalVisible, setFeedbackModalVisible] = useState(false);
-  const [feedbackRating, setFeedbackRating] = useState(0);
-  const [feedbackComment, setFeedbackComment] = useState('');
-  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
   const [videoBusy, setVideoBusy] = useState(false);
+  const [incomingMeetingId, setIncomingMeetingId] = useState(null);
   const [keyboardInset, setKeyboardInset] = useState(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [sessionBounds, setSessionBounds] = useState(null);
+  const [waitingPopup, setWaitingPopup] = useState(null);
+  const [timeWarningPopup, setTimeWarningPopup] = useState(null);
+  const {notifications} = useNotifications();
+  const shownTimeWarningIdsRef = useRef(new Set());
+  const tenMinuteWarningSentRef = useRef(false);
   const listRef = useRef(null);
   const notifIdsRef = useRef([]);
   const prevTimerPhaseRef = useRef(null);
+  const isFocusedRef = useRef(false);
+  const startedMeetingIdRef = useRef(null);
+  const autoOpenedMeetingIdRef = useRef(null);
+  const sessionWasActiveRef = useRef(false);
+  const prevIsClosedRef = useRef(null);
+  const lastThreadRef = useRef('');
 
+  const {profile} = useUserProfile();
   const chatName = route?.params?.chatName || 'Attorney';
   const initials = route?.params?.initials || 'AT';
+  const localParticipantName =
+    String(profile?.name || profile?.full_name || '').trim() || 'Client';
   const threadId = useMemo(
     () => String(route?.params?.chatId || route?.params?.chatName || 'general-chat'),
     [route?.params?.chatId, route?.params?.chatName],
   );
+  const chatOpen = isClosed === false;
+
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+      (async () => {
+        try {
+          await ensureAppConfigLoaded();
+          if (!threadId || threadId === 'general-chat') return;
+          const rows = await getMyAppointments({force: true});
+          if (cancelled) return;
+          const item = (rows || []).find(r => String(r.id) === String(threadId));
+          if (!item) return;
+          const status = String(item.status || '').toLowerCase();
+          const eligible =
+            status === 'confirmed' || status === 'rescheduled' || status === 'completed';
+          if (!eligible) return;
+          // Completed sessions stay readable; active ones must wait for schedule (web parity).
+          if (status === 'completed') return;
+          if (item.chatAccessible === false) {
+            Alert.alert(
+              'Consultation not available yet',
+              item.chatBlockedMessage ||
+                'Chat opens on your consultation day (any time that day).',
+              [{text: 'OK', onPress: () => navigation.goBack()}],
+            );
+          }
+        } catch {
+          // Offline or transient errors — do not block chat access.
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [threadId, navigation]),
+  );
 
   const loadThread = useCallback(async () => {
     try {
-      const {messages: rows, isClosed: closed} = await getThreadMessages(threadId);
+      const {messages: rows, isClosed: closed, videoMeetingId} = await getThreadMessages(threadId);
       setMessages(rows);
       setIsClosed(closed);
+      setIncomingMeetingId(prev => {
+        const next = videoMeetingId || null;
+        if (next && next === startedMeetingIdRef.current) return prev;
+        return next;
+      });
     } catch {
       setMessages([]);
       setIsClosed(false);
     }
   }, [threadId]);
+
+  useEffect(() => {
+    if (!threadId || threadId === 'general-chat') return undefined;
+    let cancelled = false;
+    let detachPresence = () => {};
+
+    (async () => {
+      const {profile} = await getCurrentSessionProfile();
+      if (cancelled || !profile?.id) return;
+      detachPresence = attachConsultationChatPresence({
+        appointmentId: threadId,
+        role: 'client',
+        userId: profile.id,
+        displayName: profile.full_name || 'Client',
+        otherPartyName: chatName,
+        onWaitingPopup: copy => setWaitingPopup(copy),
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+      detachPresence();
+    };
+  }, [threadId, chatName]);
+
+  useEffect(() => {
+    if (!threadId || threadId === 'general-chat') return;
+    const matching = (notifications || []).find(item => {
+      const type = String(item?.type || '').toLowerCase();
+      if (type !== 'consultation_time_warning') return false;
+      const body = String(item?.body || '');
+      return body.includes(`Ref #${threadId}`);
+    });
+    if (!matching?.id || shownTimeWarningIdsRef.current.has(matching.id)) return;
+    shownTimeWarningIdsRef.current.add(matching.id);
+    setTimeWarningPopup({
+      title: matching.title || 'Consultation Reminder',
+      body: matching.body || 'Only 10 minutes left. Please prepare your final questions.',
+    });
+  }, [notifications, threadId]);
+
+  useEffect(() => {
+    if (!sessionBounds || isClosed) return;
+    const {phase} = getConsultationTimerDisplay(nowMs, sessionBounds);
+    if (phase !== 'warning') {
+      tenMinuteWarningSentRef.current = false;
+      return;
+    }
+    if (tenMinuteWarningSentRef.current) return;
+    tenMinuteWarningSentRef.current = true;
+    setTimeWarningPopup({
+      title: 'Consultation Reminder',
+      body: 'Only 10 minutes left in your scheduled hour. Please prepare your final questions.',
+    });
+  }, [nowMs, sessionBounds, isClosed]);
 
   useEffect(() => {
     loadThread();
@@ -171,7 +288,20 @@ const ConsultationChat = ({navigation, route}) => {
     let cancelled = false;
     (async () => {
       try {
-        const unsub = await attachThreadRealtime(threadId, setMessages, setIsClosed);
+        const unsub = await attachThreadRealtime(
+          threadId,
+          setMessages,
+          setIsClosed,
+          {
+            onVideoMeetingChange: meetingId => {
+              setIncomingMeetingId(prev => {
+                const next = meetingId || null;
+                if (next && next === startedMeetingIdRef.current) return prev;
+                return next;
+              });
+            },
+          },
+        );
         if (!cancelled) {
           unsubscribe = unsub;
         }
@@ -187,25 +317,41 @@ const ConsultationChat = ({navigation, route}) => {
 
   useFocusEffect(
     useCallback(() => {
-      if (!isClosed || !threadId) {
-        return;
-      }
-      let cancelled = false;
-      (async () => {
-        try {
-          const has = await hasFeedbackForAppointment(threadId);
-          if (!cancelled && !has) {
-            setFeedbackModalVisible(true);
-          }
-        } catch {
-          // ignore
-        }
-      })();
+      isFocusedRef.current = true;
       return () => {
-        cancelled = true;
+        isFocusedRef.current = false;
       };
-    }, [isClosed, threadId]),
+    }, []),
   );
+
+  useEffect(() => {
+    if (threadId !== lastThreadRef.current) {
+      lastThreadRef.current = threadId;
+      sessionWasActiveRef.current = false;
+      prevIsClosedRef.current = null;
+    }
+    if (!threadId || threadId === 'general-chat') return;
+    if (isClosed === null) return;
+
+    const wasOpen = prevIsClosedRef.current === false;
+    prevIsClosedRef.current = isClosed;
+
+    if (!isClosed) {
+      sessionWasActiveRef.current = true;
+      return;
+    }
+
+    if (!wasOpen || !sessionWasActiveRef.current) return;
+
+    sessionWasActiveRef.current = false;
+    startedMeetingIdRef.current = null;
+    autoOpenedMeetingIdRef.current = null;
+    setIncomingMeetingId(null);
+    navigation.reset({
+      index: 0,
+      routes: [{name: 'HomepageClient'}],
+    });
+  }, [isClosed, threadId, navigation]);
 
   useEffect(() => {
     listRef.current?.scrollToEnd({animated: true});
@@ -231,7 +377,7 @@ const ConsultationChat = ({navigation, route}) => {
   }, []);
 
   const handleSendMessage = async () => {
-    if (!messageText.trim() || isClosed || sending) {
+    if (!messageText.trim() || !chatOpen || sending) {
       return;
     }
     try {
@@ -251,7 +397,7 @@ const ConsultationChat = ({navigation, route}) => {
   };
 
   const handlePickImage = async () => {
-    if (isClosed || sending) {
+    if (!chatOpen || sending) {
       return;
     }
     const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -287,12 +433,12 @@ const ConsultationChat = ({navigation, route}) => {
   };
 
   const handlePickFile = async () => {
-    if (isClosed || sending) {
+    if (!chatOpen || sending) {
       return;
     }
     const result = await DocumentPicker.getDocumentAsync({
       copyToCacheDirectory: true,
-      type: '*/*',
+      type: CHAT_DOCUMENT_PICKER_TYPES,
     });
     if (result.canceled) {
       return;
@@ -310,12 +456,21 @@ const ConsultationChat = ({navigation, route}) => {
     if (!asset?.uri) {
       return;
     }
+    const fileName = asset.name || 'file';
+    const mime = asset.mimeType || 'application/octet-stream';
+    if (isBlockedChatAttachment(mime, fileName)) {
+      Alert.alert(
+        'Not allowed',
+        'Videos cannot be sent in chat. Choose an image or a document (PDF, DOC, TXT).',
+      );
+      return;
+    }
     try {
       setSending(true);
       const {messages: next, isClosed: closed} = await appendThreadAttachment(threadId, {
         uri: asset.uri,
-        fileName: asset.name || 'file',
-        mime: asset.mimeType || 'application/octet-stream',
+        fileName,
+        mime,
         size: asset.size ?? 0,
         caption: messageText.trim() || undefined,
       });
@@ -329,49 +484,59 @@ const ConsultationChat = ({navigation, route}) => {
     }
   };
 
-  const handleFeedbackSubmit = async () => {
-    if (feedbackRating < 1 || feedbackRating > 5) {
-      Alert.alert('Rating', 'Please select a star rating from 1 to 5.');
-      return;
-    }
-    try {
-      setFeedbackSubmitting(true);
-      await submitConsultationFeedback(threadId, {
-        rating: feedbackRating,
-        comment: feedbackComment,
-      });
-      setFeedbackModalVisible(false);
-      setFeedbackComment('');
-      setFeedbackRating(0);
-    } catch (e) {
-      Alert.alert('Error', e?.message ?? 'Could not save feedback.');
-    } finally {
-      setFeedbackSubmitting(false);
-    }
-  };
-
-  const handleFeedbackSkip = () => {
-    setFeedbackModalVisible(false);
-  };
-
   const handleStartVideoCall = async () => {
-    if (!threadId || isClosed || videoBusy) {
+    if (!threadId || !chatOpen || videoBusy) {
       return;
     }
     try {
       setVideoBusy(true);
       const {meetingId, roomId, token} = await getOrCreateVideoMeeting(threadId);
+      startedMeetingIdRef.current = meetingId;
+      autoOpenedMeetingIdRef.current = meetingId;
+      setIncomingMeetingId(null);
       navigation.navigate('ConsultationVideoCall', {
         meetingId,
         token,
         consultationRoomId: roomId,
-        participantName: chatName || 'Client',
+        participantName: localParticipantName,
+        remoteParticipantName: chatName || 'Attorney',
       });
     } catch (e) {
       Alert.alert('Video call', e?.message ?? 'Could not start video.');
     } finally {
       setVideoBusy(false);
     }
+  };
+
+  const joinIncomingVideoCall = useCallback(
+    async meetingId => {
+      if (!threadId || !meetingId || !chatOpen) return;
+      if (videoBusy) return;
+      try {
+        setVideoBusy(true);
+        const {roomId} = await getOrCreateVideoMeeting(threadId);
+        const token = await getVideoSdkToken();
+        autoOpenedMeetingIdRef.current = meetingId;
+        navigation.navigate('ConsultationVideoCall', {
+          meetingId,
+          token,
+          consultationRoomId: roomId,
+          participantName: localParticipantName,
+          remoteParticipantName: chatName || 'Attorney',
+        });
+      } catch (e) {
+        Alert.alert('Video call', e?.message ?? 'Could not join video.');
+      } finally {
+        setVideoBusy(false);
+      }
+    },
+    [chatName, chatOpen, localParticipantName, navigation, threadId, videoBusy],
+  );
+
+  const handleDismissIncomingCall = async () => {
+    const meetingId = incomingMeetingId;
+    setIncomingMeetingId(null);
+    autoOpenedMeetingIdRef.current = meetingId;
   };
 
   const ActionButton = ({icon, label, onPress}) => (
@@ -408,7 +573,7 @@ const ConsultationChat = ({navigation, route}) => {
             <Text style={styles.headerName}>{chatName}</Text>
             <Text style={styles.headerStatus}>ONLINE</Text>
           </View>
-          {!isClosed ? (
+          {chatOpen ? (
             <TouchableOpacity
               style={styles.headerVideoBtn}
               onPress={handleStartVideoCall}
@@ -446,7 +611,35 @@ const ConsultationChat = ({navigation, route}) => {
                   nowMs={nowMs}
                   isClosed={isClosed}
                 />
-                {isClosed && (
+                {chatOpen && incomingMeetingId ? (
+                  <View style={styles.incomingCallCard}>
+                    <View style={styles.incomingCallTextWrap}>
+                      <Text style={styles.incomingCallTitle}>Incoming video call</Text>
+                      <Text style={styles.incomingCallSubtitle}>
+                        Your attorney started a video call. Tap Join to connect.
+                      </Text>
+                    </View>
+                    <View style={styles.incomingCallActions}>
+                      <TouchableOpacity
+                        style={styles.incomingCallJoinBtn}
+                        onPress={() => joinIncomingVideoCall(incomingMeetingId)}
+                        disabled={videoBusy}
+                        activeOpacity={0.85}>
+                        {videoBusy ? (
+                          <ActivityIndicator size="small" color="#fff" />
+                        ) : (
+                          <Text style={styles.incomingCallJoinText}>Join</Text>
+                        )}
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.incomingCallDismissBtn}
+                        onPress={handleDismissIncomingCall}>
+                        <Text style={styles.incomingCallDismissText}>Dismiss</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                ) : null}
+                {isClosed === true && (
                   <View style={styles.closedBadge}>
                     <Text style={styles.closedText}>
                       Consultation Ended — you can review messages below; sending is disabled.
@@ -467,7 +660,7 @@ const ConsultationChat = ({navigation, route}) => {
                     : Math.max(insets.bottom, 16),
               },
             ]}>
-            {!isClosed && (
+            {chatOpen && (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.actionsRow}>
                 <ActionButton icon="📹" label="Video" onPress={handleStartVideoCall} />
                 <ActionButton icon="🖼" label="Photo" onPress={handlePickImage} />
@@ -476,21 +669,21 @@ const ConsultationChat = ({navigation, route}) => {
             )}
             <View style={styles.inputRow}>
               <TextInput
-                style={[styles.input, isClosed && styles.inputDisabled]}
-                placeholder={isClosed ? 'Consultation closed' : `Message ${chatName}...`}
+                style={[styles.input, !chatOpen && styles.inputDisabled]}
+                placeholder={!chatOpen ? 'Consultation closed' : `Message ${chatName}...`}
                 value={messageText}
                 onChangeText={setMessageText}
                 placeholderTextColor={T.textSoft}
-                editable={!isClosed}
+                editable={chatOpen}
               />
               {sending ? (
                 <ActivityIndicator style={{marginLeft: 12}} color={T.gold[1]} />
               ) : (
                 <TouchableOpacity
-                  style={[styles.sendButton, (isClosed || !messageText.trim()) && styles.sendButtonDisabled]}
+                  style={[styles.sendButton, (!chatOpen || !messageText.trim()) && styles.sendButtonDisabled]}
                   onPress={handleSendMessage}
                   activeOpacity={0.8}
-                  disabled={isClosed || !messageText.trim()}>
+                  disabled={!chatOpen || !messageText.trim()}>
                   <Text style={styles.sendIcon}>➤</Text>
                 </TouchableOpacity>
               )}
@@ -498,59 +691,29 @@ const ConsultationChat = ({navigation, route}) => {
           </View>
         </View>
 
-      <Modal
-        visible={feedbackModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={handleFeedbackSkip}>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>How was your consultation?</Text>
-            <Text style={styles.modalSubtitle}>Rate your attorney (optional comment below)</Text>
-            <View style={styles.starRow}>
-              {[1, 2, 3, 4, 5].map(n => (
-                <TouchableOpacity
-                  key={n}
-                  onPress={() => setFeedbackRating(n)}
-                  style={styles.starHit}
-                  hitSlop={{top: 8, bottom: 8, left: 4, right: 4}}>
-                  <Text style={[styles.starGlyph, n <= feedbackRating && styles.starGlyphActive]}>
-                    ★
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-            <TextInput
-              style={styles.modalInput}
-              placeholder="Feedback (optional)"
-              placeholderTextColor={T.textSoft}
-              value={feedbackComment}
-              onChangeText={setFeedbackComment}
-              multiline
-              maxLength={1000}
-            />
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={styles.modalBtnSecondary} onPress={handleFeedbackSkip}>
-                <Text style={styles.modalBtnSecondaryText}>Skip</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[
-                  styles.modalBtnPrimary,
-                  styles.modalBtnPrimarySpaced,
-                  feedbackSubmitting && styles.modalBtnDisabled,
-                ]}
-                onPress={handleFeedbackSubmit}
-                disabled={feedbackSubmitting}>
-                {feedbackSubmitting ? (
-                  <ActivityIndicator color={T.base} />
-                ) : (
-                  <Text style={styles.modalBtnPrimaryText}>Submit</Text>
-                )}
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
+      <ConsultationWaitingPopup
+        visible={Boolean(waitingPopup)}
+        title={waitingPopup?.title}
+        body={waitingPopup?.body}
+        showGoToChatroom
+        goToChatroomLabel="Continue in Chatroom"
+        onNotNow={() => {
+          if (waitingPopup?.appointmentId) {
+            dismissConsultationPeerEntry(
+              waitingPopup.appointmentId,
+              waitingPopup.otherJoinedAt,
+            );
+          }
+          setWaitingPopup(null);
+        }}
+        onGoToChatroom={() => setWaitingPopup(null)}
+      />
+      <ConsultationWaitingPopup
+        visible={Boolean(timeWarningPopup)}
+        title={timeWarningPopup?.title}
+        body={timeWarningPopup?.body}
+        onNotNow={() => setTimeWarningPopup(null)}
+      />
     </ClientScreenShell>
   );
 };
@@ -623,6 +786,33 @@ const styles = StyleSheet.create({
   sendIcon: {color: T.base},
   closedBadge: {backgroundColor: 'rgba(251, 191, 36, 0.12)', padding: 12, borderRadius: 8, marginBottom: 20, borderWidth: 1, borderColor: 'rgba(251, 191, 36, 0.25)'},
   closedText: {color: T.gold[0], fontSize: 12, textAlign: 'center', fontWeight: 'bold'},
+  incomingCallCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(37, 99, 235, 0.18)',
+    borderColor: 'rgba(96, 165, 250, 0.55)',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 16,
+    gap: 12,
+  },
+  incomingCallTextWrap: {flex: 1, minWidth: 0},
+  incomingCallTitle: {color: T.text, fontWeight: '800', fontSize: 13},
+  incomingCallSubtitle: {color: T.textSoft, fontSize: 11, marginTop: 2},
+  incomingCallActions: {flexDirection: 'row', alignItems: 'center', gap: 6},
+  incomingCallJoinBtn: {
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 18,
+    minWidth: 56,
+    alignItems: 'center',
+  },
+  incomingCallJoinText: {color: '#fff', fontWeight: '800', fontSize: 12},
+  incomingCallDismissBtn: {paddingHorizontal: 8, paddingVertical: 6},
+  incomingCallDismissText: {color: T.textSoft, fontWeight: '700', fontSize: 11},
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(4, 7, 11, 0.65)',

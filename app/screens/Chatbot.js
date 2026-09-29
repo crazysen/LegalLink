@@ -213,7 +213,7 @@ export default function ChatbotScreen({navigation}) {
             <MaterialCommunityIcons name="robot-outline" size={22} color={T.gold[0]} />
           </View>
           <View style={styles.headerTitleContainer}>
-            <Text style={styles.headerTitle}>BatasMo Informational AI Assistant</Text>
+            <Text style={styles.headerTitle}>LegalLink Informational AI Assistant</Text>
             <View style={styles.statusContainer}>
               <View style={styles.statusDot} />
               <Text style={styles.statusText}>

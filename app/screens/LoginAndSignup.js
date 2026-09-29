@@ -8,6 +8,7 @@ import {
   InteractionManager,
   Modal,
   Platform,
+  KeyboardAvoidingView,
   SafeAreaView,
   ScrollView,
   StatusBar,
@@ -20,6 +21,17 @@ import {
 import { Feather, Ionicons } from '@expo/vector-icons';
 import { signInWithEmail, signUpWithEmail } from '../services/authService';
 import {FONT_SERIF_DISPLAY} from '../constants/platformUi';
+import {
+  formatLockoutMessage,
+  isValidEmail,
+  isGmailEmail,
+  isPhilippineMobile,
+  sanitizePhoneInput,
+  GMAIL_REQUIRED_MESSAGE,
+  PH_MOBILE_REQUIRED_MESSAGE,
+  mapLoginErrorMessage,
+  VALID_EMAIL_MESSAGE,
+} from '../utils/validators';
 
 const THEME = {
   gold: '#d4af37',
@@ -165,6 +177,34 @@ const RequirementRow = ({ label, isMet }) => (
   </View>
 );
 
+const SEX_OPTIONS = [
+  { value: 'male', label: 'Male' },
+  { value: 'female', label: 'Female' },
+  { value: 'others', label: 'Others' },
+];
+
+const SexPickerField = ({ value, onChange }) => (
+  <View style={styles.inputContainer}>
+    <Text style={styles.inputLabel}>Gender</Text>
+    <View style={styles.sexRow}>
+      {SEX_OPTIONS.map(option => {
+        const active = value === option.value;
+        return (
+          <TouchableOpacity
+            key={option.value}
+            style={[styles.sexChip, active && styles.sexChipActive]}
+            onPress={() => onChange(option.value)}
+            activeOpacity={0.85}>
+            <Text style={[styles.sexChipText, active && styles.sexChipTextActive]}>
+              {option.label}
+            </Text>
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  </View>
+);
+
 const AuthScreen = ({navigation}) => {
   const [screenState, setScreenState] = useState('LOGIN');
   const [showPassword, setShowPassword] = useState(false);
@@ -174,10 +214,10 @@ const AuthScreen = ({navigation}) => {
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
+
   const [confirmPassword, setConfirmPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [lockoutSeconds, setLockoutSeconds] = useState(0);
-  const [verificationMethod, setVerificationMethod] = useState('sms'); // 'sms' | 'email'
 
   const introOpacity = useRef(new Animated.Value(0)).current;
   const introTranslateY = useRef(new Animated.Value(20)).current;
@@ -189,6 +229,8 @@ const AuthScreen = ({navigation}) => {
   const buttonGlow = useRef(new Animated.Value(0)).current;
 
   const isLogin = screenState === 'LOGIN';
+
+
 
   const passwordChecks = useMemo(() => {
     const hasMinLength = password.length >= 8;
@@ -363,13 +405,29 @@ const AuthScreen = ({navigation}) => {
     if (isSubmitting) return;
 
     if (!isLogin) {
-      if (!fullName.trim() || !email.trim() || !password || !confirmPassword || !phone.trim()) {
-        Alert.alert('Missing information', 'Please complete all fields including mobile number.');
+      if (
+        !fullName.trim() ||
+        !email.trim() ||
+        !password ||
+        !confirmPassword ||
+        !phone.trim()
+      ) {
+        Alert.alert(
+          'Missing information',
+          'Please complete all required fields.',
+        );
         return;
       }
-      const digitsOnly = phone.replace(/\D/g, '');
-      if (digitsOnly.length < 10 || digitsOnly.length > 11) {
-        Alert.alert('Invalid mobile', 'Enter a valid Philippine mobile number (e.g. 09171234567).');
+      if (!isGmailEmail(email.trim())) {
+        Alert.alert('Invalid email', GMAIL_REQUIRED_MESSAGE);
+        return;
+      }
+      if (!isValidEmail(email.trim())) {
+        Alert.alert('Invalid email', VALID_EMAIL_MESSAGE);
+        return;
+      }
+      if (!isPhilippineMobile(phone)) {
+        Alert.alert('Invalid mobile', PH_MOBILE_REQUIRED_MESSAGE);
         return;
       }
       if (password !== confirmPassword) {
@@ -394,23 +452,19 @@ const AuthScreen = ({navigation}) => {
           fullName: fullName.trim(),
           role: 'Client',
           phone: phone.trim(),
-          verificationMethod,
         });
 
         navigation.navigate('VerifyAccount', {
           phoneE164: signUpResult.phoneE164,
-          email: email.trim(),
+          email: signUpResult.email || email.trim(),
+          pendingId: signUpResult.pendingId,
           role: 'Client',
           isNewSignup: true,
-          verificationMethod,
+          verificationMethod: 'email',
           profilePayload: {
             fullName: fullName.trim(),
             email: email.trim(),
             role: 'Client',
-            age: null,
-            address: null,
-            guardianName: null,
-            guardianContact: null,
           },
         });
       } catch (error) {
@@ -422,12 +476,22 @@ const AuthScreen = ({navigation}) => {
     }
 
     if (!email.trim() || !password) {
-      Alert.alert('Missing credentials', 'Please enter your email and password.');
+      Alert.alert('Missing credentials', 'Email and password are required.');
+      return;
+    }
+
+    if (!isLogin && !isGmailEmail(email.trim())) {
+      Alert.alert('Invalid email', GMAIL_REQUIRED_MESSAGE);
+      return;
+    }
+
+    if (!isValidEmail(email.trim())) {
+      Alert.alert('Invalid email', VALID_EMAIL_MESSAGE);
       return;
     }
 
     if (lockoutSeconds > 0) {
-      Alert.alert('Account Locked', `Please wait ${formatLockoutTime(lockoutSeconds)} before trying again.`);
+      Alert.alert('Account locked', formatLockoutMessage(lockoutSeconds));
       return;
     }
 
@@ -440,8 +504,8 @@ const AuthScreen = ({navigation}) => {
       if (data?.needsPhoneVerification) {
         if (!data.phoneE164ForVerification) {
           Alert.alert(
-            'Phone verification',
-            'Your account needs a mobile number on file for SMS verification. Please update your profile or contact support.',
+            'Verification required',
+            'Please complete email verification before signing in.',
           );
           return;
         }
@@ -450,8 +514,17 @@ const AuthScreen = ({navigation}) => {
           email: email.trim(),
           role: role === 'attorney' ? 'Attorney' : 'Client',
           isNewSignup: false,
+          verificationMethod: 'email',
           profilePayload: null,
         });
+        return;
+      }
+
+      if (role === 'admin') {
+        Alert.alert(
+          'Admin sign-in',
+          'Admin tools (reschedule approvals, dashboard) are available on the LegalLink web app. Use the same email and password there.',
+        );
         return;
       }
 
@@ -461,6 +534,17 @@ const AuthScreen = ({navigation}) => {
         navigation.reset({ index: 0, routes: [{ name: 'HomepageClient' }] });
       }
     } catch (error) {
+      if (error?.code === 'SIGNUP_OTP_REQUIRED' || error?.message === 'SIGNUP_OTP_REQUIRED') {
+        navigation.navigate('VerifyAccount', {
+          email: error?.email || email.trim(),
+          role: 'Client',
+          isNewSignup: true,
+          verificationMethod: 'email',
+          profilePayload: null,
+        });
+        return;
+      }
+
       const message = error?.message || 'Unable to sign in. Please try again.';
       const normalized = String(message).toLowerCase();
 
@@ -476,13 +560,9 @@ const AuthScreen = ({navigation}) => {
         const seconds = parseInt(message.split(':')[1], 10);
         const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
         setLockoutSeconds(safeSeconds);
-        const minutes = Math.max(1, Math.ceil(safeSeconds / 60));
-        Alert.alert(
-          'Too many attempts',
-          `Try again in about ${minutes} minute${minutes === 1 ? '' : 's'}. An admin can clear failed logins in Supabase. For local testing only, add EXPO_PUBLIC_SKIP_LOGIN_LOCKOUT=1 to .env and restart Expo.`,
-        );
+        Alert.alert('Account locked', formatLockoutMessage(safeSeconds));
       } else {
-        Alert.alert('Login failed', message);
+        Alert.alert('Login failed', mapLoginErrorMessage(error));
       }
     } finally {
       setIsSubmitting(false);
@@ -492,6 +572,10 @@ const AuthScreen = ({navigation}) => {
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
+      <KeyboardAvoidingView
+        style={styles.keyboardAvoid}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 8 : 0}>
 
       <View style={styles.backgroundLayer} pointerEvents="none">
         <AnimatedImageBackground
@@ -524,7 +608,10 @@ const AuthScreen = ({navigation}) => {
         />
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled">
         <Animated.View style={[styles.topBar, containerStyle]}>
           <PressScaleButton
             style={styles.backButtonWrap}
@@ -536,7 +623,7 @@ const AuthScreen = ({navigation}) => {
           </PressScaleButton>
 
           <View style={styles.brandBadge}>
-            <Text style={styles.brandBadgeText}>Batas Mo</Text>
+            <Text style={styles.brandBadgeText}>LegalLink</Text>
           </View>
         </Animated.View>
 
@@ -585,12 +672,13 @@ const AuthScreen = ({navigation}) => {
               label="Mobile Number"
               placeholder="09171234567"
               value={phone}
-              onChangeText={setPhone}
+              onChangeText={text => setPhone(sanitizePhoneInput(text))}
               keyboardType="phone-pad"
               showPassword={showPassword}
               onTogglePassword={() => setShowPassword((v) => !v)}
             />
           )}
+
           <AuthInputField
             label="Email Address"
             placeholder="name@domain.com"
@@ -676,42 +764,6 @@ const AuthScreen = ({navigation}) => {
             </View>
           )}
 
-          {!isLogin && (
-            <View style={styles.verifyToggleRow}>
-              <Text style={styles.verifyToggleLabel}>Verify via:</Text>
-              <View style={styles.verifyToggleGroup}>
-                <TouchableOpacity
-                  style={[
-                    styles.verifyToggleBtn,
-                    verificationMethod === 'sms' && styles.verifyToggleBtnActive,
-                  ]}
-                  onPress={() => setVerificationMethod('sms')}>
-                  <Text
-                    style={[
-                      styles.verifyToggleBtnText,
-                      verificationMethod === 'sms' && styles.verifyToggleBtnTextActive,
-                    ]}>
-                    📱 SMS
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[
-                    styles.verifyToggleBtn,
-                    verificationMethod === 'email' && styles.verifyToggleBtnActive,
-                  ]}
-                  onPress={() => setVerificationMethod('email')}>
-                  <Text
-                    style={[
-                      styles.verifyToggleBtnText,
-                      verificationMethod === 'email' && styles.verifyToggleBtnTextActive,
-                    ]}>
-                    ✉️ Email
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          )}
-
           <PressScaleButton
             style={styles.primaryButtonWrap}
             contentStyle={[styles.primaryButton, (isSubmitting || (isLogin && lockoutSeconds > 0)) && styles.primaryButtonDisabled]}
@@ -735,6 +787,7 @@ const AuthScreen = ({navigation}) => {
           </View>
         </Animated.View>
       </ScrollView>
+      </KeyboardAvoidingView>
 
       <Modal visible={showTermsModal} transparent animationType="fade">
         <View style={styles.modalOverlay}>
@@ -742,9 +795,9 @@ const AuthScreen = ({navigation}) => {
             <Text style={styles.modalTitle}>Terms and Conditions</Text>
             <ScrollView style={styles.modalScroll}>
               <Text style={styles.modalBody}>
-                By accessing and using the BatasMo platform, you agree to provide accurate and complete information and to use the system only for lawful purposes. Users are responsible for maintaining the confidentiality of their account and any activities performed under it.
+                By accessing and using the LegalLink platform, you agree to provide accurate and complete information and to use the system only for lawful purposes. Users are responsible for maintaining the confidentiality of their account and any activities performed under it.
                 {'\n\n'}
-                BatasMo respects and protects your personal data in accordance with the Data Privacy Act of 2012 (Republic Act No. 10173). All information submitted will be securely stored and used only for legal consultation services.
+                LegalLink respects and protects your personal data in accordance with the Data Privacy Act of 2012 (Republic Act No. 10173). All information submitted will be securely stored and used only for legal consultation services.
                 {'\n\n'}
                 By proceeding, you confirm that you have read, understood, and agreed to these terms.
               </Text>
@@ -807,10 +860,39 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.12,
     shadowRadius: 24,
   },
+  keyboardAvoid: {
+    flex: 1,
+  },
   scrollContent: {
     paddingHorizontal: 18,
     paddingTop: 10,
-    paddingBottom: 36,
+    paddingBottom: 48,
+  },
+  sexRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  sexChip: {
+    flex: 1,
+    height: 44,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    backgroundColor: 'rgba(11, 20, 29, 0.94)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sexChipActive: {
+    borderColor: 'rgba(212, 175, 55, 0.55)',
+    backgroundColor: 'rgba(212, 175, 55, 0.14)',
+  },
+  sexChipText: {
+    color: THEME.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  sexChipTextActive: {
+    color: THEME.gold,
   },
   topBar: {
     flexDirection: 'row',

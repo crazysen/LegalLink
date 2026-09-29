@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   e164ToPhilippinesLocal11,
   maskPhilippinesPhone,
@@ -20,10 +21,14 @@ import {
   resendPhoneVerificationOtp,
   requestPhoneVerificationSms,
   verifyPhoneOtp,
-  verifySignUpOtp,
   resendSignUpOtp,
   upsertProfileFromVerificationPayload,
+  completePendingSignup,
+  signInWithEmail,
+  OTP_RESUME_SIGNUP_KEY,
+  PENDING_SIGNUP_ID_KEY,
 } from '../services/authService';
+import { markSignupOtpCompleted } from '../services/signupVerification';
 import { supabase } from '../services/supabaseClient';
 import {FONT_SERIF_DISPLAY} from '../constants/platformUi';
 import {useUserProfile} from '../context/UserProfileContext';
@@ -80,11 +85,11 @@ export default function VerifyAccount({navigation, route}) {
 
   const paramPhoneE164 = route?.params?.phoneE164;
   const email = route?.params?.email || '';
+  const pendingIdParam = route?.params?.pendingId || '';
   const role = route?.params?.role || 'Client';
   const profilePayload = route?.params?.profilePayload;
   const isNewSignup = route?.params?.isNewSignup !== false;
-  const verificationMethod = route?.params?.verificationMethod ?? 'sms';
-  const isEmailVerif = verificationMethod === 'email';
+  const isEmailVerif = isNewSignup || route?.params?.verificationMethod === 'email';
 
   const [phoneE164, setPhoneE164] = useState(paramPhoneE164 || null);
 
@@ -203,8 +208,33 @@ export default function VerifyAccount({navigation, route}) {
     try {
       setIsVerifying(true);
 
-      if (isEmailVerif) {
-        await verifySignUpOtp({ email, token });
+      if (isNewSignup && isEmailVerif) {
+        const resumeRaw = await AsyncStorage.getItem(OTP_RESUME_SIGNUP_KEY);
+        if (!resumeRaw) {
+          throw new Error('Session expired. Please sign up again.');
+        }
+        let resume;
+        try {
+          resume = JSON.parse(resumeRaw);
+        } catch {
+          throw new Error('Session expired. Please sign up again.');
+        }
+        const pendingId =
+          pendingIdParam || (await AsyncStorage.getItem(PENDING_SIGNUP_ID_KEY)) || undefined;
+        await completePendingSignup({
+          email,
+          pendingId,
+          otp: token,
+          password: resume.password,
+        });
+        await signInWithEmail({
+          email: resume.email || email,
+          password: resume.password,
+        });
+        await markSignupOtpCompleted();
+        await AsyncStorage.multiRemove([OTP_RESUME_SIGNUP_KEY, PENDING_SIGNUP_ID_KEY]);
+      } else if (isEmailVerif) {
+        throw new Error('Use the email link or sign up again to verify your account.');
       } else {
         if (!phoneE164) {
           Alert.alert('Missing phone', 'No phone number on file. Please sign up again or contact support.');
@@ -213,7 +243,7 @@ export default function VerifyAccount({navigation, route}) {
         await verifyPhoneOtp({ phone: phoneE164, token });
       }
 
-      if (profilePayload && phoneE164) {
+      if (profilePayload && phoneE164 && !isNewSignup) {
         await upsertProfileFromVerificationPayload(phoneE164, profilePayload);
       }
 
@@ -261,7 +291,9 @@ export default function VerifyAccount({navigation, route}) {
     try {
       setIsResending(true);
       if (isEmailVerif) {
-        await resendSignUpOtp({ email });
+        const pendingId =
+          pendingIdParam || (await AsyncStorage.getItem(PENDING_SIGNUP_ID_KEY)) || undefined;
+        await resendSignUpOtp({ email, pendingId });
         Alert.alert('Code Sent', 'A new verification code has been sent to your email.');
       } else {
         try {
@@ -318,7 +350,7 @@ export default function VerifyAccount({navigation, route}) {
             <Text style={styles.backText}>Back</Text>
           </PressScaleButton>
           <View style={styles.brandBadge}>
-            <Text style={styles.brandBadgeText}>Batas Mo</Text>
+            <Text style={styles.brandBadgeText}>LegalLink</Text>
           </View>
         </Animated.View>
 

@@ -6,7 +6,7 @@ import {
 } from '../constants/routeAlignment';
 import {supabase} from '../services/supabaseClient';
 
-export const PENDING_DEEP_LINK_KEY = 'batasmo_pending_deep_link_v1';
+export const PENDING_DEEP_LINK_KEY = 'legallink_pending_deep_link_v1';
 const STORAGE_KEY = PENDING_DEEP_LINK_KEY;
 
 /**

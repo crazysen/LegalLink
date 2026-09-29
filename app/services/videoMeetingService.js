@@ -105,61 +105,41 @@ export async function getOrCreateVideoMeeting(appointmentId) {
     throw new Error('appointmentId is required');
   }
 
-  const { data: room, error: roomError } = await supabase
-    .from('consultation_rooms')
-    .select('id, video_meeting_id')
-    .eq('appointment_id', appointmentId)
-    .maybeSingle();
-
-  if (roomError) {
-    throw roomError;
-  }
-  if (!room) {
-    throw new Error('Consultation room not found for this appointment.');
-  }
-
-  if (room.video_meeting_id) {
-    const videoToken = await getVideoSdkToken();
-    return { meetingId: room.video_meeting_id, roomId: room.id, token: videoToken };
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session?.access_token) {
+    throw new Error('Not authenticated');
   }
 
   const base = resolveVideoBackendBaseUrl();
-
-  const createRes = await fetch(`${base}/videosdk-create-room`, {
+  const res = await fetch(`${base}/videosdk-meeting-for-appointment`, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: '{}',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify({ appointmentId }),
   });
 
-  if (!createRes.ok) {
-    const text = await createRes.text();
-    let message = `VideoSDK room creation failed (${createRes.status})`;
-    try {
-      const j = JSON.parse(text);
-      if (j?.error) {
-        message = String(j.error);
-      }
-    } catch {
-      /* ignore */
-    }
-    throw new Error(message);
+  const body = await res.text();
+  let payload = null;
+  try {
+    payload = body ? JSON.parse(body) : null;
+  } catch {
+    payload = null;
   }
 
-  const { roomId: newMeetingId, token: videoToken } = await createRes.json();
-  if (!newMeetingId || !videoToken) {
-    throw new Error('Invalid response from videosdk-create-room.');
+  if (!res.ok) {
+    throw new Error(payload?.error || `Video meeting setup failed (${res.status})`);
   }
 
-  const { error: updateError } = await supabase
-    .from('consultation_rooms')
-    .update({ video_meeting_id: newMeetingId })
-    .eq('id', room.id);
-
-  if (updateError) {
-    throw updateError;
+  const { meetingId, roomId, token } = payload || {};
+  if (!meetingId || !roomId || !token) {
+    throw new Error('Video meeting response was incomplete.');
   }
 
-  return { meetingId: newMeetingId, roomId: room.id, token: videoToken };
+  return { meetingId, roomId, token };
 }
 
 export async function clearVideoMeetingId(consultationRoomId) {

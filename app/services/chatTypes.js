@@ -15,6 +15,39 @@ export const CHAT_LIMITS = {
   ],
 };
 
+/** Expo DocumentPicker `type` — images use ImagePicker; documents only (no video). */
+export const CHAT_DOCUMENT_PICKER_TYPES = [...CHAT_LIMITS.fileMime];
+
+const VIDEO_EXTENSIONS = new Set([
+  'mp4',
+  'mov',
+  'avi',
+  'mkv',
+  'webm',
+  'm4v',
+  '3gp',
+  'mpeg',
+  'mpg',
+  'wmv',
+  'flv',
+]);
+
+/**
+ * @param {string} [mime]
+ * @param {string} [fileName]
+ */
+export function isBlockedChatAttachment(mime, fileName) {
+  const m = String(mime || '').toLowerCase();
+  if (m.startsWith('video/')) {
+    return true;
+  }
+  const ext = String(fileName || '')
+    .split('.')
+    .pop()
+    ?.toLowerCase();
+  return Boolean(ext && VIDEO_EXTENSIONS.has(ext));
+}
+
 export const CHAT_BUCKETS = {
   image: 'chat-images',
   file: 'chat-files',
@@ -31,11 +64,18 @@ export function bucketForMessageType(mime) {
 /**
  * @param {number} sizeBytes
  * @param {string} mime
+ * @param {string} [fileName]
  * @returns {{ ok: boolean, error?: string }}
  */
-export function validateAttachment(sizeBytes, mime) {
+export function validateAttachment(sizeBytes, mime, fileName) {
   const n = Number(sizeBytes) || 0;
   const m = String(mime || '').toLowerCase();
+  if (isBlockedChatAttachment(m, fileName)) {
+    return {
+      ok: false,
+      error: 'Videos cannot be sent in chat. Use images or documents (PDF, DOC, TXT) only.',
+    };
+  }
   if (m.startsWith('image/')) {
     if (!CHAT_LIMITS.imageMime.includes(m)) {
       return {ok: false, error: 'Unsupported image type.'};

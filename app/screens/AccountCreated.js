@@ -106,7 +106,7 @@ export default function AccountCreated({navigation, route}) {
             <View style={styles.checkGlow} />
           </Animated.View>
 
-          <Text style={styles.welcomeTitle}>Welcome to BatasMo!</Text>
+          <Text style={styles.welcomeTitle}>Welcome to LegalLink!</Text>
           <Text style={styles.welcomeSub}>
             Your account has been successfully created. You can now start connecting with legal professionals.
           </Text>

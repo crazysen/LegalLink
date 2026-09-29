@@ -7,6 +7,13 @@ const cors = require('cors');
 const multer = require('multer');
 const FormData = require('form-data');
 const { createFaceIdSign } = require('./faceidSign');
+const { createFacePlusRouter } = require('./faceplusRoutes');
+const faceplusQueue = require('./faceplusQueue');
+const {
+  createDiditRouter,
+  isConfigured: isDiditSessionConfigured,
+  isApiKeyConfigured: isDiditApiConfigured,
+} = require('./diditRoutes');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -196,8 +203,17 @@ app.post('/faceid/verify', upload.single('meglive_data'), async (req, res) => {
   }
 });
 
+app.use('/faceplus', createFacePlusRouter({ checkMobileAuth }));
+app.use('/didit', createDiditRouter({ checkMobileAuth }));
+
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, faceidConfigured: Boolean(FACEID_API_KEY && FACEID_API_SECRET) });
+  res.json({
+    ok: true,
+    faceidConfigured: Boolean(FACEID_API_KEY && FACEID_API_SECRET),
+    faceplusConfigured: faceplusQueue.isConfigured(),
+    diditConfigured: isDiditApiConfigured(),
+    diditSessionReady: isDiditSessionConfigured(),
+  });
 });
 
 app.listen(PORT, () => {

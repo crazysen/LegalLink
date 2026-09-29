@@ -47,12 +47,12 @@ export function getSupabaseEnvDebug() {
 
 if (!process.env.EXPO_PUBLIC_SUPABASE_URL && !process.env.REACT_APP_SUPABASE_URL) {
   console.warn(
-    '[BatasMo] Using fallback Supabase URL. Set EXPO_PUBLIC_SUPABASE_URL (same as web REACT_APP_SUPABASE_URL).',
+    '[LegalLink] Using fallback Supabase URL. Set EXPO_PUBLIC_SUPABASE_URL (same as web REACT_APP_SUPABASE_URL).',
   );
 }
 if (!process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY && !process.env.REACT_APP_SUPABASE_ANON_KEY) {
   console.warn(
-    '[BatasMo] Using fallback Supabase anon key. Set EXPO_PUBLIC_SUPABASE_ANON_KEY for production.',
+    '[LegalLink] Using fallback Supabase anon key. Set EXPO_PUBLIC_SUPABASE_ANON_KEY for production.',
   );
 }
 

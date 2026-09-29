@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const CACHE_KEY = 'batasmo_user_profile_v1';
+const CACHE_KEY = 'legallink_user_profile_v1';
 
 /**
  * Persisted profile slice for instant greeting after cold start (until Supabase hydrates).

@@ -1,4 +1,6 @@
 import { supabase } from './supabaseClient';
+import { notifyAdminsOfNewNotarialRequest } from './userApi';
+import { resolveNotarialAmount } from '../constants/notarialFees';
 
 /** Must match a public bucket with upload policies for authenticated users (see Supabase Storage). */
 const STORAGE_BUCKET = 'documents';
@@ -139,7 +141,7 @@ export async function createNotarialRequest(payload) {
   let documentUrl = payload.document_url ? String(payload.document_url).trim() : '';
 
   // Run both uploads in parallel to cut wait time roughly in half
-  const [mainUrl, idUrl] = await Promise.all([
+  const [mainUrl, idUrl, idBackUrl] = await Promise.all([
     documentUrl || !payload.document_base64
       ? Promise.resolve(documentUrl)
       : uploadBase64ToDocuments(
@@ -148,12 +150,20 @@ export async function createNotarialRequest(payload) {
           payload.document_name || 'notarial-document.pdf',
           'main',
         ),
-    payload.id_base64
+    payload.id_front_base64 || payload.id_base64
       ? uploadBase64ToDocuments(
           user.id,
-          payload.id_base64,
-          payload.id_name || 'government-id',
-          'id',
+          payload.id_front_base64 || payload.id_base64,
+          payload.id_name || 'government-id-front',
+          'id-front',
+        )
+      : Promise.resolve(null),
+    payload.id_back_base64
+      ? uploadBase64ToDocuments(
+          user.id,
+          payload.id_back_base64,
+          'government-id-back',
+          'id-back',
         )
       : Promise.resolve(null),
   ]);
@@ -165,27 +175,74 @@ export async function createNotarialRequest(payload) {
 
   let detailsText = payload.details?.trim() || null;
   if (idUrl) {
-    const idLine = `[Government ID on file: ${idUrl}]`;
+    const idMeta = [
+      payload.id_type_label || payload.id_type,
+      payload.id_verified_name,
+      payload.id_verified_document_number,
+      payload.id_detected_type ? `detected: ${payload.id_detected_type}` : null,
+    ]
+      .filter(Boolean)
+      .join(' | ');
+    const idLine = `[Government ID on file: ${idUrl}${idBackUrl ? `, back: ${idBackUrl}` : ''}${idMeta ? ` (${idMeta})` : ''}]`;
     detailsText = detailsText ? `${detailsText}\n\n${idLine}` : idLine;
+  }
+
+  const preferredDate = payload.preferred_date || payload.preferredDate || null;
+
+  const insertPayload = {
+    client_id: user.id,
+    attorney_id: null,
+    service_type: payload.service_type,
+    details: detailsText,
+    document_url: documentUrl,
+    amount: resolveNotarialAmount(payload.amount),
+    status: 'pending',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  if (preferredDate) {
+    insertPayload.preferred_date = preferredDate;
   }
 
   const { data, error } = await supabase
     .from('notarial_requests')
-    .insert({
-      client_id: user.id,
-      attorney_id: payload.attorney_id || null,
-      service_type: payload.service_type,
-      details: detailsText,
-      document_url: documentUrl,
-      status: 'pending',
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
+    .insert(insertPayload)
     .select()
     .single();
 
   if (error) throw new Error(error.message);
+
+  await notifyAdminsOfNewNotarialRequest({
+    clientId: user.id,
+    serviceType: payload.service_type,
+    preferredDate,
+  });
+
   return data;
+}
+
+/** Web parity: a client may swap the uploaded file while the request is still unpaid. */
+export async function replaceNotarialRequestDocument({requestId, documentBase64, documentName}) {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('Not authenticated');
+  if (!requestId) throw new Error('Missing request.');
+  if (!documentBase64) throw new Error('No document to upload.');
+
+  const documentUrl = await uploadBase64ToDocuments(
+    user.id,
+    documentBase64,
+    documentName || 'notarial-document.pdf',
+    'main',
+  );
+
+  const { error } = await supabase
+    .from('notarial_requests')
+    .update({ document_url: documentUrl, updated_at: new Date().toISOString() })
+    .eq('id', requestId)
+    .eq('client_id', user.id);
+
+  if (error) throw new Error(error.message);
+  return documentUrl;
 }
 
 export async function updateNotarialRequestStatus(requestId, status) {
