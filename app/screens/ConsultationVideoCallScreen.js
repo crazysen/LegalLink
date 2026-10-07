@@ -1,12 +1,12 @@
-import React, {useCallback, useEffect, useRef, useState} from 'react';
+import React, {Component, useCallback, useEffect, useRef, useState} from 'react';
 import {
   ActivityIndicator,
+  DeviceEventEmitter,
   PermissionsAndroid,
   Platform,
   StyleSheet,
   Text,
   TouchableOpacity,
-  useWindowDimensions,
   View,
 } from 'react-native';
 import Constants from 'expo-constants';
@@ -14,53 +14,29 @@ import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {MaterialCommunityIcons} from '@expo/vector-icons';
 import InCallManager from '@videosdk.live/react-native-incallmanager';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
-import {clearVideoMeetingId} from '../services/videoMeetingService';
+import {supabase} from '../services/supabaseClient';
 
-const JOIN_TIMEOUT_MS = 30000;
+const JOIN_TIMEOUT_MS = 25000;
+const JOIN_RETRY_DELAY_MS = 1200;
+const MAX_JOIN_RETRIES = 1;
 const CTRL_HIT = 48;
 
+const ROUTE_SPEAKER = 'SPEAKER_PHONE';
+const ROUTE_EARPIECE = 'EARPIECE';
+
 /**
- * Force loudspeaker vs earpiece using VideoSDK InCallManager device selection.
- * Prefer chooseAudioRoute / switchAudioDevice (maps to native selectAudioDevice);
- * setForceSpeakerphoneOn alone is unreliable on newer Android when auto-routing fights it.
+ * Android: the native device manager only routes to devices in its available set, which is
+ * populated only in automatic mode (start({auto: true})); a user selection always wins over auto.
+ * iOS: chooseAudioRoute/selectAudioDevice are not exported natively; setSpeakerphoneOn resets the
+ * session category (drops DefaultToSpeaker) so the earpiece route actually takes effect.
  */
 async function applyVideoCallAudioRoute(speakerEnabled) {
-  const route = speakerEnabled ? 'SPEAKER_PHONE' : 'EARPIECE';
-  try {
-    if (typeof InCallManager.chooseAudioRoute === 'function') {
-      await InCallManager.chooseAudioRoute(route);
-    }
-  } catch (err) {
-    console.warn('[video] chooseAudioRoute failed', err?.message || err);
+  if (Platform.OS === 'android') {
+    await InCallManager.chooseAudioRoute(speakerEnabled ? ROUTE_SPEAKER : ROUTE_EARPIECE);
+    return;
   }
-
-  try {
-    if (typeof InCallManager.switchAudioDevice === 'function') {
-      await InCallManager.switchAudioDevice(route);
-    }
-  } catch (err) {
-    console.warn('[video] switchAudioDevice failed', err?.message || err);
-  }
-
-  try {
-    // iOS uses this path; Android also updates forceSpeakerOn + selectAudioDevice.
-    InCallManager.setForceSpeakerphoneOn(Boolean(speakerEnabled));
-    if (Platform.OS === 'android') {
-      InCallManager.setSpeakerphoneOn(Boolean(speakerEnabled));
-    }
-  } catch (err) {
-    console.warn('[video] setForceSpeakerphoneOn failed', err?.message || err);
-  }
-
-  try {
-    if (speakerEnabled) {
-      InCallManager.stopProximitySensor?.();
-    } else {
-      InCallManager.startProximitySensor?.();
-    }
-  } catch {
-    /* proximity optional */
-  }
+  InCallManager.setForceSpeakerphoneOn(Boolean(speakerEnabled));
+  InCallManager.setSpeakerphoneOn(Boolean(speakerEnabled));
 }
 
 const PIP_WIDTH = 112;
@@ -69,50 +45,99 @@ const PIP_ASPECT = 16 / 9;
 const EXPO_GO_HINT =
   'Video calls need native WebRTC. Expo Go does not include it. Create a development build: npx expo prebuild then npx expo run:android (or run:ios), or use EAS Build.';
 
+class VideoErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = {hasError: false};
+  }
+
+  static getDerivedStateFromError() {
+    return {hasError: true};
+  }
+
+  componentDidCatch(error) {
+    console.warn('[video] SDK error caught by boundary:', error?.message || error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <View style={styles.centerBox}>
+          <Text style={styles.errorText}>
+            Video call encountered an error. Please close and try again.
+          </Text>
+          <TouchableOpacity style={styles.leaveBtn} onPress={this.props.onClose}>
+            <Text style={styles.leaveBtnText}>Close</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function VideoCallHeader({onClose}) {
+  return (
+    <View style={styles.vcHeader}>
+      <Text style={styles.vcTitle}>Video Consultation</Text>
+      <TouchableOpacity
+        style={styles.vcClose}
+        onPress={onClose}
+        accessibilityRole="button"
+        accessibilityLabel="Close video call"
+        hitSlop={{top: 8, bottom: 8, left: 8, right: 8}}>
+        <Text style={styles.vcCloseText}>✕</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+const toInitials = name =>
+  (name || '?')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(p => p[0])
+    .slice(0, 2)
+    .join('')
+    .toUpperCase();
+
 function ParticipantVideo({sdk, participantId, label, variant}) {
   const participant = sdk.useParticipant(participantId);
-  const {webcamStream, webcamOn, displayName, isLocal} = participant || {};
+  const {webcamStream, webcamOn, micOn, displayName, isLocal} = participant || {};
   const {RTCView, MediaStream} = sdk;
 
   const tileLabel = label || displayName || (isLocal ? 'You' : 'Participant');
   const isPip = variant === 'pip';
   const videoStyle = isPip ? styles.pipRtc : styles.remoteRtc;
   const containerStyle = isPip ? styles.pipInner : styles.remoteInner;
+  const hasLiveVideo = Boolean(webcamOn && webcamStream?.track);
 
-  if (webcamOn && webcamStream?.track) {
-    const stream = new MediaStream([webcamStream.track]);
-    return (
-      <View style={containerStyle}>
+  return (
+    <View style={[containerStyle, !hasLiveVideo && styles.placeholder]}>
+      {hasLiveVideo ? (
         <RTCView
           objectFit="cover"
           style={videoStyle}
-          streamURL={stream.toURL()}
+          streamURL={new MediaStream([webcamStream.track]).toURL()}
           mirror={Boolean(isLocal)}
           zOrder={isPip ? 1 : 0}
         />
+      ) : (
+        <View style={isPip ? styles.pipAvatar : styles.remoteAvatar}>
+          <Text style={isPip ? styles.pipInitial : styles.remoteInitial}>{toInitials(tileLabel)}</Text>
+        </View>
+      )}
+      <View style={isPip ? styles.pipLabelPill : styles.remoteLabelPill}>
         <Text style={isPip ? styles.pipLabel : styles.remoteLabel} numberOfLines={1}>
           {tileLabel}
           {isLocal ? ' (You)' : ''}
         </Text>
       </View>
-    );
-  }
-
-  return (
-    <View style={[containerStyle, styles.placeholder]}>
-      <Text style={isPip ? styles.pipInitial : styles.remoteInitial}>
-        {(tileLabel || '?')
-          .split(/\s+/)
-          .filter(Boolean)
-          .map(p => p[0])
-          .join('')
-          .slice(0, 2)
-          .toUpperCase()}
-      </Text>
-      <Text style={isPip ? styles.pipLabel : styles.remoteLabel} numberOfLines={1}>
-        {tileLabel}
-        {isLocal ? ' (You)' : ''}
-      </Text>
+      {micOn === false ? (
+        <View style={isPip ? styles.pipMicOff : styles.remoteMicOff}>
+          <MaterialCommunityIcons name="microphone-off" size={isPip ? 12 : 16} color="#FCA5A5" />
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -142,7 +167,10 @@ function MeetingVideoStage({sdk, participantIds, localDisplayName, remoteDisplay
 
   const localId = participantIds.find(pid => rolesById[pid] === true) ?? null;
   const remoteIds = participantIds.filter(pid => rolesById[pid] === false);
+  // Web layout: remote fills the stage, local is the PiP; alone, you fill the stage.
   const primaryRemoteId = remoteIds[0] ?? null;
+  const primaryId = primaryRemoteId || localId;
+  const pipId = primaryRemoteId ? localId : null;
 
   return (
     <View style={styles.stage}>
@@ -150,11 +178,11 @@ function MeetingVideoStage({sdk, participantIds, localDisplayName, remoteDisplay
         <ParticipantRoleReporter key={`role-${pid}`} sdk={sdk} participantId={pid} onRole={reportRole} />
       ))}
 
-      {primaryRemoteId ? (
+      {primaryId ? (
         <ParticipantVideo
           sdk={sdk}
-          participantId={primaryRemoteId}
-          label={remoteDisplayName}
+          participantId={primaryId}
+          label={primaryRemoteId ? remoteDisplayName : localDisplayName}
           variant="remote"
         />
       ) : (
@@ -163,11 +191,11 @@ function MeetingVideoStage({sdk, participantIds, localDisplayName, remoteDisplay
         </View>
       )}
 
-      {localId ? (
+      {pipId ? (
         <View style={[styles.pipContainer, {width: PIP_WIDTH, height: pipHeight}]}>
           <ParticipantVideo
             sdk={sdk}
-            participantId={localId}
+            participantId={pipId}
             label={localDisplayName}
             variant="pip"
           />
@@ -183,20 +211,37 @@ function MeetingVideoStage({sdk, participantIds, localDisplayName, remoteDisplay
   );
 }
 
-function MeetingContent({sdk, meetingId, onRequestLeave, localDisplayName, remoteDisplayName}) {
+function MeetingContent({
+  sdk,
+  meetingId,
+  onRequestLeave,
+  localDisplayName,
+  remoteDisplayName,
+  roomClosed,
+}) {
   const {useMeeting} = sdk;
   const insets = useSafeAreaInsets();
-  const {width: windowWidth, height: windowHeight} = useWindowDimensions();
-  const isPortraitLayout = windowHeight >= windowWidth;
 
   const [joinState, setJoinState] = useState('JOINING');
   const [joinError, setJoinError] = useState('');
   const [speakerOn, setSpeakerOn] = useState(true);
+  const speakerOnRef = useRef(true);
   const joinedRef = useRef(false);
   const timeoutRef = useRef(null);
+  const retryCountRef = useRef(0);
   const finishedRef = useRef(false);
+  const hasLeftRef = useRef(false);
+  const leaveRef = useRef(null);
+  const joinRef = useRef(null);
   const facingModeRef = useRef('front');
   const audioStartedRef = useRef(false);
+
+  const clearJoinTimeout = () => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  };
 
   const finishSession = useCallback(() => {
     if (finishedRef.current) {
@@ -212,6 +257,43 @@ function MeetingContent({sdk, meetingId, onRequestLeave, localDisplayName, remot
     onRequestLeave();
   }, [onRequestLeave]);
 
+  // Always tell VideoSDK we left (close button, hardware back, room closed) so the
+  // other participant does not keep a frozen tile until the SDK times us out.
+  const leaveMeeting = useCallback(() => {
+    if (hasLeftRef.current) {
+      return;
+    }
+    hasLeftRef.current = true;
+    try {
+      leaveRef.current?.();
+    } catch {
+      /* meeting already torn down */
+    }
+  }, []);
+
+  const startJoinTimeout = () => {
+    clearJoinTimeout();
+    timeoutRef.current = setTimeout(() => {
+      setJoinState(prev => {
+        if (prev !== 'JOINING') {
+          return prev;
+        }
+        if (retryCountRef.current < MAX_JOIN_RETRIES) {
+          retryCountRef.current += 1;
+          try {
+            joinRef.current?.();
+            startJoinTimeout();
+            return 'JOINING';
+          } catch {
+            /* fall through to error */
+          }
+        }
+        setJoinError('Connection timed out. Please check your internet and try again.');
+        return 'ERROR';
+      });
+    }, JOIN_TIMEOUT_MS);
+  };
+
   const {
     join,
     leave,
@@ -224,19 +306,34 @@ function MeetingContent({sdk, meetingId, onRequestLeave, localDisplayName, remot
     changeWebcam,
   } = useMeeting({
     onMeetingJoined: () => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-      }
+      clearJoinTimeout();
+      retryCountRef.current = 0;
       setJoinState('JOINED');
     },
     onMeetingLeft: () => {
       finishSession();
     },
+    onWebcamRequested: ({accept}) => {
+      if (typeof accept === 'function') accept();
+    },
+    onMicRequested: ({accept}) => {
+      if (typeof accept === 'function') accept();
+    },
     onError: err => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
+      clearJoinTimeout();
+      if (retryCountRef.current < MAX_JOIN_RETRIES) {
+        retryCountRef.current += 1;
+        setJoinState('JOINING');
+        setJoinError('');
+        setTimeout(() => {
+          try {
+            joinRef.current?.();
+            startJoinTimeout();
+          } catch {
+            /* surfaced by the next onError / timeout */
+          }
+        }, JOIN_RETRY_DELAY_MS);
+        return;
       }
       const msg =
         err && (err.message || err.code) ? String(err.message || err.code) : 'Failed to connect to the video call.';
@@ -245,29 +342,56 @@ function MeetingContent({sdk, meetingId, onRequestLeave, localDisplayName, remot
     },
   });
 
+  leaveRef.current = leave;
+  joinRef.current = join;
+
+  useEffect(
+    () => () => {
+      finishedRef.current = true;
+      clearJoinTimeout();
+      leaveMeeting();
+      try {
+        InCallManager.stop();
+      } catch {
+        /* ignore */
+      }
+    },
+    [leaveMeeting],
+  );
+
   useEffect(() => {
-    if (joinState !== 'JOINED') {
+    if (joinState !== 'JOINED' || audioStartedRef.current) {
       return;
     }
-    let cancelled = false;
-    (async () => {
-      try {
-        if (!audioStartedRef.current) {
-          audioStartedRef.current = true;
-          // auto: false so automatic route selection does not override the speaker toggle.
-          InCallManager.start({media: 'video', auto: false});
-        }
-        if (!cancelled) {
-          await applyVideoCallAudioRoute(speakerOn);
-        }
-      } catch (err) {
-        console.warn('[video] InCallManager audio setup failed', err?.message || err);
+    audioStartedRef.current = true;
+    try {
+      InCallManager.start({media: 'video', auto: true});
+    } catch (err) {
+      console.warn('[video] InCallManager start failed', err?.message || err);
+    }
+    applyVideoCallAudioRoute(speakerOnRef.current).catch(err => {
+      console.warn('[video] initial audio route failed', err?.message || err);
+    });
+  }, [joinState]);
+
+  // Android: the device list fills in asynchronously (UI thread / Bluetooth). Re-assert the
+  // user's speaker/earpiece choice whenever the native manager reports a different route.
+  useEffect(() => {
+    if (Platform.OS !== 'android') {
+      return undefined;
+    }
+    const sub = DeviceEventEmitter.addListener('onAudioDeviceChanged', data => {
+      const selected = String(data?.selectedAudioDevice || '');
+      if (selected !== ROUTE_SPEAKER && selected !== ROUTE_EARPIECE) {
+        return;
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [joinState, speakerOn]);
+      const desired = speakerOnRef.current ? ROUTE_SPEAKER : ROUTE_EARPIECE;
+      if (selected !== desired) {
+        InCallManager.chooseAudioRoute(desired).catch(() => {});
+      }
+    });
+    return () => sub.remove();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -289,49 +413,36 @@ function MeetingContent({sdk, meetingId, onRequestLeave, localDisplayName, remot
         return;
       }
 
-      timeoutRef.current = setTimeout(() => {
-        setJoinState(prev => {
-          if (prev === 'JOINING') {
-            setJoinError('Connection timed out. Check your network and try again.');
-            return 'ERROR';
-          }
-          return prev;
-        });
-      }, JOIN_TIMEOUT_MS);
-
+      startJoinTimeout();
       join();
     })();
 
     return () => {
       cancelled = true;
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-      }
+      clearJoinTimeout();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleLeave = useCallback(() => {
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-    try {
-      leave();
-    } catch {
-      /* ignore */
-    }
+    clearJoinTimeout();
+    leaveMeeting();
     finishSession();
-  }, [leave, finishSession]);
+  }, [leaveMeeting, finishSession]);
+
+  // Attorney ended the consultation — drop out of the call immediately (web parity).
+  useEffect(() => {
+    if (roomClosed) {
+      handleLeave();
+    }
+  }, [roomClosed, handleLeave]);
 
   const handleToggleSpeaker = useCallback(() => {
-    setSpeakerOn(prev => {
-      const next = !prev;
-      applyVideoCallAudioRoute(next).catch(err => {
-        console.warn('[video] speaker toggle failed', err?.message || err);
-      });
-      return next;
+    const next = !speakerOnRef.current;
+    speakerOnRef.current = next;
+    setSpeakerOn(next);
+    applyVideoCallAudioRoute(next).catch(err => {
+      console.warn('[video] speaker toggle failed', err?.message || err);
     });
   }, []);
 
@@ -367,25 +478,34 @@ function MeetingContent({sdk, meetingId, onRequestLeave, localDisplayName, remot
   const camOn = localWebcamOn ?? true;
 
   return (
-    <View style={[styles.meetingRoot, isPortraitLayout && styles.meetingRootPortrait]}>
-      {joinState !== 'JOINED' && (
-        <Text style={styles.meetingIdLabel} numberOfLines={1}>
-          Meeting: {meetingId}
-        </Text>
-      )}
+    <View style={styles.meetingRoot}>
+      <VideoCallHeader onClose={handleLeave} />
+      <Text style={styles.meetingIdLabel} numberOfLines={1}>
+        Meeting ID: {meetingId}
+      </Text>
 
       {(joinState === 'JOINING' || joinState === 'IDLE') && (
         <View style={styles.centerBox}>
           <ActivityIndicator size="large" color={T.gold[1]} />
-          <Text style={styles.hint}>Connecting…</Text>
+          <Text style={styles.hint}>Connecting to video call…</Text>
         </View>
       )}
 
       {joinState === 'ERROR' && (
         <View style={styles.centerBox}>
           <Text style={styles.errorText}>{joinError}</Text>
-          <TouchableOpacity style={styles.leaveBtn} onPress={handleLeave}>
-            <Text style={styles.leaveBtnText}>Close</Text>
+        </View>
+      )}
+
+      {joinState !== 'JOINED' && (
+        <View style={[styles.controls, {paddingBottom: Math.max(insets.bottom, 12)}]}>
+          <TouchableOpacity
+            style={[styles.ctrl, styles.ctrlDanger]}
+            onPress={handleLeave}
+            accessibilityRole="button"
+            accessibilityLabel="Leave call"
+            hitSlop={{top: 6, bottom: 6, left: 6, right: 6}}>
+            <MaterialCommunityIcons name="phone-hangup" size={24} color="#fff" />
           </TouchableOpacity>
         </View>
       )}
@@ -449,7 +569,7 @@ function MeetingContent({sdk, meetingId, onRequestLeave, localDisplayName, remot
               accessibilityRole="button"
               accessibilityLabel="Leave call"
               hitSlop={{top: 6, bottom: 6, left: 6, right: 6}}>
-              <MaterialCommunityIcons name="phone-hangup" size={24} color="#F87171" />
+              <MaterialCommunityIcons name="phone-hangup" size={24} color="#fff" />
             </TouchableOpacity>
           </View>
         </>
@@ -509,43 +629,46 @@ function VideoMeetingSession({
   token,
   participantName,
   remoteParticipantName,
-  consultationRoomId,
   navigation,
   preparedTracks,
+  roomClosed,
 }) {
   const insets = useSafeAreaInsets();
   const {MeetingProvider} = sdk;
 
-  const onRequestLeave = useCallback(async () => {
-    await clearVideoMeetingId(consultationRoomId);
+  // Leave the call UI only — keep video_meeting_id so both sides can rejoin (web parity).
+  const onRequestLeave = useCallback(() => {
     if (navigation.canGoBack()) {
       navigation.goBack();
     }
-  }, [consultationRoomId, navigation]);
+  }, [navigation]);
 
   return (
     <View style={[styles.shell, {paddingTop: insets.top}]}>
-      <MeetingProvider
-        config={{
-          meetingId,
-          micEnabled: true,
-          webcamEnabled: true,
-          name: participantName || 'Participant',
-          multiStream: false,
-          customCameraVideoTrack: preparedTracks?.videoTrack || undefined,
-          customMicrophoneAudioTrack: preparedTracks?.audioTrack || undefined,
-        }}
-        token={token}
-        joinWithoutUserInteraction={false}
-        reinitialiseMeetingOnConfigChange={false}>
-        <MeetingContent
-          sdk={sdk}
-          meetingId={meetingId}
-          onRequestLeave={onRequestLeave}
-          localDisplayName={participantName}
-          remoteDisplayName={remoteParticipantName}
-        />
-      </MeetingProvider>
+      <VideoErrorBoundary onClose={onRequestLeave}>
+        <MeetingProvider
+          config={{
+            meetingId,
+            micEnabled: true,
+            webcamEnabled: true,
+            name: participantName || 'Participant',
+            multiStream: false,
+            customCameraVideoTrack: preparedTracks?.videoTrack || undefined,
+            customMicrophoneAudioTrack: preparedTracks?.audioTrack || undefined,
+          }}
+          token={token}
+          joinWithoutUserInteraction={false}
+          reinitialiseMeetingOnConfigChange={false}>
+          <MeetingContent
+            sdk={sdk}
+            meetingId={meetingId}
+            onRequestLeave={onRequestLeave}
+            localDisplayName={participantName}
+            remoteDisplayName={remoteParticipantName}
+            roomClosed={roomClosed}
+          />
+        </MeetingProvider>
+      </VideoErrorBoundary>
     </View>
   );
 }
@@ -564,7 +687,47 @@ export default function ConsultationVideoCallScreen({navigation, route}) {
   const [loadError, setLoadError] = useState(null);
   const [preparedTracks, setPreparedTracks] = useState(null);
   const [tracksReady, setTracksReady] = useState(false);
+  const [roomClosed, setRoomClosed] = useState(false);
   const trackCleanupRef = useRef(null);
+
+  const handleClose = useCallback(() => {
+    if (navigation.canGoBack()) {
+      navigation.goBack();
+    }
+  }, [navigation]);
+
+  useEffect(() => {
+    if (!consultationRoomId) {
+      return undefined;
+    }
+    const channel = supabase
+      .channel(`video-room-close:${consultationRoomId}:${Date.now()}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'consultation_rooms',
+          filter: `id=eq.${consultationRoomId}`,
+        },
+        payload => {
+          if (payload?.new?.is_closed) {
+            setRoomClosed(true);
+          }
+        },
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [consultationRoomId]);
+
+  // Closed before the meeting UI mounted (still loading SDK / camera).
+  useEffect(() => {
+    if (roomClosed && (!sdk || !tracksReady)) {
+      handleClose();
+    }
+  }, [roomClosed, sdk, tracksReady, handleClose]);
 
   useEffect(() => {
     let cancelled = false;
@@ -645,36 +808,43 @@ export default function ConsultationVideoCallScreen({navigation, route}) {
     };
   }, [sdk, meetingId, token]);
 
+  const renderShell = children => (
+    <View style={[styles.shell, {paddingTop: insets.top}]}>
+      <VideoCallHeader onClose={handleClose} />
+      <View style={styles.fallback}>{children}</View>
+    </View>
+  );
+
   if (!meetingId || !token) {
-    return (
-      <View style={[styles.fallback, {paddingTop: insets.top + 24}]}>
+    return renderShell(
+      <>
         <Text style={styles.errorText}>Missing video meeting or token.</Text>
-        <TouchableOpacity style={styles.leaveBtn} onPress={() => navigation.goBack()}>
+        <TouchableOpacity style={styles.leaveBtn} onPress={handleClose}>
           <Text style={styles.leaveBtnText}>Go back</Text>
         </TouchableOpacity>
-      </View>
+      </>,
     );
   }
 
   if (loadError) {
-    return (
-      <View style={[styles.fallback, {paddingTop: insets.top + 24, paddingHorizontal: 20}]}>
+    return renderShell(
+      <>
         <Text style={styles.errorText}>{loadError}</Text>
-        <TouchableOpacity style={styles.leaveBtn} onPress={() => navigation.goBack()}>
+        <TouchableOpacity style={styles.leaveBtn} onPress={handleClose}>
           <Text style={styles.leaveBtnText}>Go back</Text>
         </TouchableOpacity>
-      </View>
+      </>,
     );
   }
 
   if (!sdk || !tracksReady) {
-    return (
-      <View style={[styles.fallback, {paddingTop: insets.top + 48}]}>
+    return renderShell(
+      <>
         <ActivityIndicator size="large" color={T.gold[1]} />
         <Text style={styles.hint}>
-          {!sdk ? 'Loading video…' : 'Preparing camera…'}
+          {!sdk ? 'Loading video…' : 'Preparing HD camera & microphone…'}
         </Text>
-      </View>
+      </>,
     );
   }
 
@@ -685,9 +855,9 @@ export default function ConsultationVideoCallScreen({navigation, route}) {
       token={token}
       participantName={participantName}
       remoteParticipantName={remoteParticipantName}
-      consultationRoomId={consultationRoomId}
       navigation={navigation}
       preparedTracks={preparedTracks}
+      roomClosed={roomClosed}
     />
   );
 }
@@ -696,12 +866,33 @@ const styles = StyleSheet.create({
   shell: {flex: 1, backgroundColor: T.base},
   fallback: {flex: 1, padding: 24, justifyContent: 'center'},
   meetingRoot: {flex: 1},
-  meetingRootPortrait: {flex: 1},
+  vcHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(244,215,139,0.12)',
+  },
+  vcTitle: {color: T.text, fontSize: 15, fontWeight: '700', letterSpacing: 0.3},
+  vcClose: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  vcCloseText: {color: T.textSoft, fontSize: 14, fontWeight: '700'},
   meetingIdLabel: {
     paddingHorizontal: 16,
-    paddingVertical: 8,
+    paddingVertical: 6,
     color: T.textMuted,
-    fontSize: 12,
+    fontSize: 11,
+    letterSpacing: 0.5,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.05)',
   },
   centerBox: {flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24},
   hint: {marginTop: 12, color: T.textSoft, textAlign: 'center'},
@@ -722,23 +913,38 @@ const styles = StyleSheet.create({
     width: '100%',
     height: '100%',
   },
-  remoteLabel: {
+  remoteLabelPill: {
     position: 'absolute',
-    left: 16,
-    bottom: 16,
-    right: 16,
-    color: T.text,
-    fontSize: 13,
-    fontWeight: '700',
-    textShadowColor: 'rgba(0,0,0,0.75)',
-    textShadowOffset: {width: 0, height: 1},
-    textShadowRadius: 3,
+    left: 12,
+    bottom: 12,
+    maxWidth: '75%',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    backgroundColor: 'rgba(0,0,0,0.55)',
   },
-  remoteInitial: {fontSize: 48, fontWeight: '800', color: T.gold[0]},
+  remoteLabel: {color: '#F9FAFB', fontSize: 12, fontWeight: '600'},
+  remoteMicOff: {
+    position: 'absolute',
+    right: 12,
+    bottom: 12,
+    padding: 4,
+    borderRadius: 6,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  remoteAvatar: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: '#2563EB',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  remoteInitial: {fontSize: 22, fontWeight: '700', color: '#fff', letterSpacing: 1},
   waitingText: {color: T.textMuted, fontSize: 15, textAlign: 'center', paddingHorizontal: 24},
   pipContainer: {
     position: 'absolute',
-    top: 12,
+    bottom: 12,
     right: 12,
     zIndex: 20,
     borderRadius: 12,
@@ -764,19 +970,34 @@ const styles = StyleSheet.create({
     width: '100%',
     height: '100%',
   },
-  pipLabel: {
+  pipLabelPill: {
     position: 'absolute',
     left: 6,
     bottom: 6,
-    right: 6,
-    color: T.text,
-    fontSize: 10,
-    fontWeight: '700',
-    textShadowColor: 'rgba(0,0,0,0.75)',
-    textShadowOffset: {width: 0, height: 1},
-    textShadowRadius: 2,
+    maxWidth: '80%',
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    borderRadius: 4,
+    backgroundColor: 'rgba(0,0,0,0.55)',
   },
-  pipInitial: {fontSize: 22, fontWeight: '800', color: T.gold[0]},
+  pipLabel: {color: '#F9FAFB', fontSize: 10, fontWeight: '600'},
+  pipMicOff: {
+    position: 'absolute',
+    right: 6,
+    bottom: 6,
+    padding: 2,
+    borderRadius: 4,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  pipAvatar: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#2563EB',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pipInitial: {fontSize: 14, fontWeight: '700', color: '#fff'},
   placeholder: {justifyContent: 'center', alignItems: 'center'},
   extraRemoteHint: {
     position: 'absolute',
@@ -823,8 +1044,8 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(244,215,139,0.45)',
   },
   ctrlDanger: {
-    backgroundColor: 'rgba(220,38,38,0.28)',
-    borderColor: 'rgba(248,113,113,0.55)',
+    backgroundColor: '#EF4444',
+    borderColor: '#EF4444',
   },
   leaveBtn: {
     marginTop: 8,

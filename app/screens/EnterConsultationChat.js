@@ -11,7 +11,7 @@ import {
   ActivityIndicator,
   Keyboard,
 } from 'react-native';
-import {useFocusEffect} from '@react-navigation/native';
+import {useFocusEffect, useIsFocused} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {MaterialCommunityIcons} from '@expo/vector-icons';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
@@ -56,6 +56,7 @@ import {useNotifications} from '../context/NotificationContext';
 
 const ConsultationChat = ({navigation, route}) => {
   const insets = useSafeAreaInsets();
+  const isFocused = useIsFocused();
   const [messageText, setMessageText] = useState('');
   const [messages, setMessages] = useState([]);
   const [isClosed, setIsClosed] = useState(null);
@@ -539,6 +540,19 @@ const ConsultationChat = ({navigation, route}) => {
     autoOpenedMeetingIdRef.current = meetingId;
   };
 
+  // Web parity: auto-open the call once when the attorney starts it; the banner stays as the fallback/rejoin.
+  useEffect(() => {
+    if (!isFocused || !chatOpen || !incomingMeetingId) return;
+    if (autoOpenedMeetingIdRef.current === incomingMeetingId) return;
+    autoOpenedMeetingIdRef.current = incomingMeetingId;
+    joinIncomingVideoCall(incomingMeetingId);
+  }, [isFocused, chatOpen, incomingMeetingId, joinIncomingVideoCall]);
+
+  useEffect(() => {
+    if (!chatOpen) return;
+    getVideoSdkToken().catch(() => {});
+  }, [chatOpen]);
+
   const ActionButton = ({icon, label, onPress}) => (
     <TouchableOpacity style={styles.actionChip} onPress={onPress} activeOpacity={0.7}>
       <Text style={styles.actionIcon}>{icon}</Text>
@@ -614,7 +628,7 @@ const ConsultationChat = ({navigation, route}) => {
                 {chatOpen && incomingMeetingId ? (
                   <View style={styles.incomingCallCard}>
                     <View style={styles.incomingCallTextWrap}>
-                      <Text style={styles.incomingCallTitle}>Incoming video call</Text>
+                      <Text style={styles.incomingCallTitle}>Video call in progress</Text>
                       <Text style={styles.incomingCallSubtitle}>
                         Your attorney started a video call. Tap Join to connect.
                       </Text>

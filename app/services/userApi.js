@@ -1136,53 +1136,6 @@ export async function payForAppointment({ appointmentId, clientId, attorneyId, a
   }
 }
 
-/**
- * @deprecated Not used on mobile — web has no PayMongo notarial route. Use payForNotarialRequest.
- * Creates a PayMongo checkout session via POST /payments/notarial/create-session (local backend only).
- */
-export async function payForNotarialSession({ notarialRequestId, clientId, amount, method, methodTypes }) {
-  const paymentMethod = normalizePaymentMethodKey(method)
-  const paymentMethodTypes = normalizePaymentMethodTypes(methodTypes, paymentMethod)
-
-  const payload = await requestPaymentApi('/payments/notarial/create-session', {
-    method: 'POST',
-    body: {
-      notarialRequestId,
-      clientId,
-      amount: Number(amount || 0),
-      method: paymentMethod,
-      paymentMethodTypes,
-    },
-  })
-
-  if (!payload?.checkoutUrl || !payload?.transactionId) {
-    throw new Error('Payment provider returned an invalid session payload.')
-  }
-
-  return {
-    transactionId: payload.transactionId,
-    checkoutUrl: payload.checkoutUrl,
-    status: payload.status || 'pending',
-    checkoutSessionId: payload.checkoutSessionId || null,
-  }
-}
-
-/**
- * Polls /payments/notarial/status/:transactionId for a notarial payment status.
- */
-export async function getNotarialPaymentStatus(transactionId) {
-  if (!transactionId) throw new Error('transactionId is required')
-
-  const payload = await requestPaymentApi(
-    `/payments/notarial/status/${encodeURIComponent(transactionId)}`,
-  )
-  return {
-    transactionId: payload?.transactionId || transactionId,
-    notarialRequestId: payload?.notarialRequestId || null,
-    status: String(payload?.status || 'pending').toLowerCase(),
-  }
-}
-
 export async function getAppointmentPaymentStatus(transactionId) {
   if (!transactionId) throw new Error('transactionId is required')
 
@@ -1783,11 +1736,13 @@ export async function fetchClientNotarialRequests(userId) {
   if (requestsRes.error) throw requestsRes.error
   if (transactionsRes.error) throw transactionsRes.error
 
-  let paymentByRequest = new Map(
-    (transactionsRes.data || [])
-      .filter((tx) => tx.notarial_request_id)
-      .map((tx) => [tx.notarial_request_id, tx.payment_status]),
-  )
+  // A request can have several attempts (pending/failed + paid); paid wins.
+  let paymentByRequest = new Map()
+  for (const tx of transactionsRes.data || []) {
+    if (!tx.notarial_request_id) continue
+    if (isPaymentStatusPaid(paymentByRequest.get(tx.notarial_request_id))) continue
+    paymentByRequest.set(tx.notarial_request_id, tx.payment_status)
+  }
 
   paymentByRequest = await healBundledNotarialPayments(
     userId,
@@ -1873,7 +1828,7 @@ export function subscribeToClientNotarialRequests(clientId, onChange) {
   }
 }
 
-/** Web parity: record notarial payment in Supabase (no /payments/notarial/* PayMongo route). */
+/** Records a paid notarial transaction directly (bundled consultation checkout only). */
 export async function payForNotarialRequest({ requestId, clientId, attorneyId, amount, method }) {
   const paymentMethod = normalizeDigitalPaymentMethod(method)
 

@@ -7,6 +7,7 @@ import {
   Text,
   TouchableOpacity,
   Image,
+  ScrollView,
 } from 'react-native';
 import * as WebBrowser from 'expo-web-browser';
 import { REFERENCE_THEME as T } from '../constants/referenceTheme';
@@ -33,7 +34,16 @@ import { warmPaymentBackend } from '../services/paymentApiClient';
 import {
   DEFAULT_PAYMENT_METHOD,
   PAYMONGO_PAYMENT_METHOD_TYPES,
+  NOTARIAL_PAYMENT_METHODS,
+  normalizeNotarialPaymentMethod,
+  getNotarialPaymentMethodLabel,
 } from '../constants/paymentConfig';
+
+const PAYMENT_METHOD_LOGOS = {
+  gcash: require('../assets/images/Gcash_logo.png'),
+  maya: require('../assets/images/Maya_logo.png'),
+  qrph: require('../assets/images/QR_Ph_Logo.png'),
+};
 const PAYMENT_POLL_INITIAL_MS = 800;
 const PAYMENT_POLL_MAX_MS = 5000;
 const PAYMENT_POLL_BACKOFF_MS = 400;
@@ -60,10 +70,10 @@ export default function Payment({navigation, route}) {
   const isWebStyleConsultationPay =
     paymentContext?.sourceType === 'appointment' ||
     paymentContext?.sourceType === 'appointment_booking';
+  const isNotarialPay = paymentContext?.sourceType === 'notarial';
+  // Notarial waits for the client's method choice before creating a session.
   const canPrefetchCheckoutSession =
-    Boolean(paymentContext?.sourceId) &&
-    (paymentContext?.sourceType === 'appointment' ||
-      paymentContext?.sourceType === 'notarial');
+    Boolean(paymentContext?.sourceId) && paymentContext?.sourceType === 'appointment';
   const notarialRequestIdRef = useRef(
     paymentContext?.sourceType === 'notarial' ? paymentContext.sourceId : null,
   );
@@ -83,13 +93,25 @@ export default function Payment({navigation, route}) {
   const [paymentStatus, setPaymentStatus] = useState('idle');
   const cancelPaymentRef = useRef(false);
   const prefetchStartedRef = useRef(false);
+  const [notarialMethod, setNotarialMethod] = useState(() =>
+    normalizeNotarialPaymentMethod(paymentMethod),
+  );
 
-  const getPaymentMethodLabel = () => 'QR Ph';
+  const getPaymentMethodLabel = () =>
+    isNotarialPay ? getNotarialPaymentMethodLabel(notarialMethod) : 'QR Ph';
 
   const getMethodIcon = () => '🔳';
 
-  const getMethodLogo = () => require('../assets/images/QR_Ph_Logo.png');
+  const getMethodLogo = () =>
+    PAYMENT_METHOD_LOGOS[isNotarialPay ? notarialMethod : 'qrph'] || PAYMENT_METHOD_LOGOS.qrph;
 
+  const handleSelectNotarialMethod = (key) => {
+    if (isPaying || key === notarialMethod) return;
+    setNotarialMethod(key);
+    setCheckoutSession(null);
+    transactionIdRef.current = null;
+    setPaymentStatus('idle');
+  };
 
 
   const ensureAppointmentBooking = async () => {
@@ -264,12 +286,10 @@ export default function Payment({navigation, route}) {
       }
       let attorneyId = paymentContext.attorneyId ?? null;
       let amount = paymentContext.amount ?? null;
-      let serviceType = paymentContext.serviceType ?? null;
-      if (amount == null || serviceType == null) {
+      if (amount == null) {
         const row = await fetchNotarialPaymentDetails(paymentContext.sourceId);
         if (attorneyId == null) attorneyId = row.attorneyId ?? null;
-        if (amount == null) amount = row.amount;
-        if (serviceType == null) serviceType = row.serviceType ?? null;
+        amount = row.amount;
       }
       await warmPaymentBackend();
 
@@ -278,13 +298,9 @@ export default function Payment({navigation, route}) {
         clientId,
         attorneyId,
         amount: Number(amount || 0),
-        serviceType,
-        method: toPayApiMethod(paymentMethod),
-        methodTypes: PAYMONGO_PAYMENT_METHOD_TYPES,
+        method: notarialMethod,
       });
-      appointmentIdRef.current = session.appointmentId || null;
       notarialRequestIdRef.current = paymentContext.sourceId;
-      appointmentCreatedRef.current = Boolean(session.appointmentId);
       setCheckoutSession(session);
       transactionIdRef.current = session.transactionId || null;
       return session;
@@ -331,20 +347,9 @@ export default function Payment({navigation, route}) {
   };
 
   const completePaidCheckout = async (session) => {
-    const isNotarial = paymentContext?.sourceType === 'notarial';
-
-    if (isNotarial) {
-      const notarialRequestId =
-        notarialRequestIdRef.current || paymentContext?.sourceId || null;
-      if (notarialRequestId && clientIdRef.current) {
-        await finalizeNotarialAfterPaidCheckout({
-          notarialRequestId,
-          clientId: clientIdRef.current,
-          amount: paymentContext?.amount ?? null,
-          transactionId: session.transactionId,
-        });
-      }
-    } else {
+    // Standalone notarial: the backend status poll already linked the transaction
+    // and sent the admin/attorney/client notifications (web parity).
+    if (!isNotarialPay) {
       try {
         const appointmentId = appointmentIdRef.current || paymentContext?.sourceId || null;
         await notifyAttorneyOfPaidBooking({ appointmentId });
@@ -436,6 +441,7 @@ export default function Payment({navigation, route}) {
       transactionId: session.transactionId,
       paymentContext,
       serviceData,
+      paymentMethodLabel: getPaymentMethodLabel(),
     });
   };
 
@@ -501,7 +507,9 @@ export default function Payment({navigation, route}) {
 
       await warmPaymentBackend();
 
-      const session = checkoutSession || (await buildPaymongoSession());
+      // Notarial: fresh session per attempt so a retry never reuses a cancelled checkout.
+      const session =
+        (!isNotarialPay && checkoutSession) || (await buildPaymongoSession());
       if (!session?.checkoutUrl) {
         throw new Error('Checkout URL is missing. Please try again.');
       }
@@ -681,7 +689,10 @@ export default function Payment({navigation, route}) {
         </View>
       </View>
 
-      <View style={styles.content}>
+      <ScrollView
+        style={styles.fill}
+        contentContainerStyle={styles.content}
+        keyboardShouldPersistTaps="handled">
         <View style={styles.brandRow}>
           {getMethodLogo() ? (
             <Image 
@@ -699,9 +710,40 @@ export default function Payment({navigation, route}) {
 
         {isPaymongoFlow ? (
           <>
+            {isNotarialPay && !isPaying ? (
+              <View style={styles.methodList}>
+                <Text style={styles.methodListLabel}>Choose payment method</Text>
+                {NOTARIAL_PAYMENT_METHODS.map((m) => {
+                  const selected = m.key === notarialMethod;
+                  return (
+                    <TouchableOpacity
+                      key={m.key}
+                      style={[styles.methodOption, selected && styles.methodOptionSelected]}
+                      onPress={() => handleSelectNotarialMethod(m.key)}
+                      activeOpacity={0.85}>
+                      <Image
+                        source={PAYMENT_METHOD_LOGOS[m.key]}
+                        style={styles.methodOptionLogo}
+                        resizeMode="contain"
+                      />
+                      <View style={styles.methodOptionText}>
+                        <Text style={styles.methodOptionTitle}>{m.label}</Text>
+                        <Text style={styles.methodOptionDesc}>{m.description}</Text>
+                      </View>
+                      <View style={[styles.methodRadio, selected && styles.methodRadioSelected]}>
+                        {selected ? <View style={styles.methodRadioDot} /> : null}
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            ) : null}
+
             <Text style={styles.instructionText}>
               {isPaying
-                ? 'Waiting for payment confirmation… For QR Ph, finish in your banking app, then return here. Use Cancel Payment to stop.'
+                ? isNotarialPay && notarialMethod !== 'qrph'
+                  ? `Waiting for payment confirmation… Finish in ${getPaymentMethodLabel()}, then return here. Use Cancel Payment to stop.`
+                  : 'Waiting for payment confirmation… For QR Ph, finish in your banking app, then return here. Use Cancel Payment to stop.'
                 : sessionPreparing
                   ? 'Preparing secure checkout…'
                   : checkoutSession
@@ -777,7 +819,7 @@ export default function Payment({navigation, route}) {
             </TouchableOpacity>
           </>
         )}
-      </View>
+      </ScrollView>
       </ClientFadeInSoft>
     </ClientScreenShell>
   );
@@ -801,7 +843,7 @@ const styles = StyleSheet.create({
   totalAmountLabel: { color: T.textSoft, fontSize: 12, fontWeight: 'bold', letterSpacing: 1 },
   amountValue: { color: T.gold[0], fontSize: 48, fontWeight: 'bold', marginTop: 8 },
   
-  content: { flex: 1, alignItems: 'center', paddingHorizontal: 30, paddingTop: 40 },
+  content: { flexGrow: 1, alignItems: 'center', paddingHorizontal: 30, paddingTop: 40, paddingBottom: 30 },
   brandRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 20 },
   gcashIcon: { 
     backgroundColor: 'rgba(59, 130, 246, 0.35)', 
@@ -886,6 +928,50 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.05)',
     marginBottom: 18,
   },
+  methodList: { width: '100%', marginBottom: 18 },
+  methodListLabel: {
+    color: T.textSoft,
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    marginBottom: 10,
+  },
+  methodOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.15)',
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    marginBottom: 8,
+  },
+  methodOptionSelected: {
+    borderColor: T.gold[1],
+    backgroundColor: 'rgba(244, 215, 139, 0.1)',
+  },
+  methodOptionLogo: {
+    width: 36,
+    height: 36,
+    borderRadius: 8,
+    backgroundColor: '#fff',
+    marginRight: 12,
+  },
+  methodOptionText: { flex: 1 },
+  methodOptionTitle: { color: T.text, fontSize: 15, fontWeight: '700' },
+  methodOptionDesc: { color: T.textSoft, fontSize: 12, marginTop: 2 },
+  methodRadio: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: 'rgba(244, 215, 139, 0.4)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  methodRadioSelected: { borderColor: T.gold[1] },
+  methodRadioDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: T.gold[1] },
   statusLabel: { color: T.textSoft, fontSize: 12, fontWeight: '600' },
   statusValue: { color: T.text, fontSize: 12, fontWeight: '800', letterSpacing: 0.4 },
 });

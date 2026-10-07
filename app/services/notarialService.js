@@ -117,9 +117,12 @@ export async function getNotarialRequests() {
       throw new Error(txError.message || 'Failed to load payment status.');
     }
 
-    paymentByRequest = new Map(
-      (txRows || []).map((row) => [row.notarial_request_id, row.payment_status]),
-    );
+    // A request can have several attempts (pending/failed + paid); paid wins.
+    for (const row of txRows || []) {
+      if (!row.notarial_request_id) continue;
+      if (String(paymentByRequest.get(row.notarial_request_id) || '').toLowerCase() === 'paid') continue;
+      paymentByRequest.set(row.notarial_request_id, row.payment_status);
+    }
   }
 
   return (data || []).map(row => {

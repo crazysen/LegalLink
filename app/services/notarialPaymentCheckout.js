@@ -1,10 +1,7 @@
 import { supabase } from './supabaseClient';
 import { requestPaymentApi } from './paymentApiClient';
 import { resolveNotarialAmount } from '../constants/notarialFees';
-
-const normalizePaymentMethodKey = () => 'qrph';
-
-const normalizePaymentMethodTypes = () => ['qrph'];
+import { normalizeNotarialPaymentMethod } from '../constants/paymentConfig';
 
 async function fetchNotarialPaymentDetails(requestId) {
   const { data, error } = await supabase
@@ -22,109 +19,10 @@ async function fetchNotarialPaymentDetails(requestId) {
   };
 }
 
-async function payForAppointment({ appointmentId, clientId, attorneyId, amount, method, methodTypes }) {
-  const paymentMethod = normalizePaymentMethodKey(method);
-  const paymentMethodTypes = normalizePaymentMethodTypes(methodTypes, paymentMethod);
-
-  const payload = await requestPaymentApi('/payments/appointments/create-session', {
-    method: 'POST',
-    body: {
-      appointmentId,
-      clientId,
-      attorneyId,
-      amount: Number(amount || 0),
-      method: paymentMethod,
-      paymentMethodTypes,
-    },
-  });
-
-  if (!payload?.checkoutUrl || !payload?.transactionId) {
-    throw new Error('Payment provider returned an invalid session payload.');
-  }
-
-  return {
-    transactionId: payload.transactionId,
-    checkoutUrl: payload.checkoutUrl,
-    status: payload.status || 'pending',
-    checkoutSessionId: payload.checkoutSessionId || null,
-  };
-}
-
 const isMissingColumnError = (error, columnName) => {
   const message = String(error?.message || '').toLowerCase();
   return error?.code === '42703' || message.includes(String(columnName || '').toLowerCase());
 };
-
-const notarialPaymentAppointmentMarker = (notarialRequestId) =>
-  `[notarial:${notarialRequestId}]`;
-
-async function resolveNotarialPaymentAttorneyId(explicitAttorneyId) {
-  if (explicitAttorneyId) return explicitAttorneyId;
-
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('id')
-    .eq('role', 'Attorney')
-    .limit(1)
-    .maybeSingle();
-
-  if (error) throw error;
-  if (!data?.id) {
-    throw new Error('No attorney profile is available to route payment. Please try again later.');
-  }
-  return data.id;
-}
-
-async function ensureNotarialPaymentAppointment({
-  clientId,
-  notarialRequestId,
-  attorneyId,
-  amount,
-  serviceType,
-}) {
-  const marker = notarialPaymentAppointmentMarker(notarialRequestId);
-  const { data: existing, error: existingError } = await supabase
-    .from('appointments')
-    .select('id, attorney_id, amount, status')
-    .eq('client_id', clientId)
-    .ilike('notes', `%${marker}%`)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (existingError) throw existingError;
-  if (existing?.id && !['cancelled', 'completed'].includes(String(existing.status || '').toLowerCase())) {
-    return {
-      appointmentId: existing.id,
-      attorneyId: existing.attorney_id,
-      amount: resolveNotarialAmount(existing.amount ?? amount),
-    };
-  }
-
-  const resolvedAttorneyId = await resolveNotarialPaymentAttorneyId(attorneyId);
-  const nowIso = new Date().toISOString();
-  const { data: created, error: insertError } = await supabase
-    .from('appointments')
-    .insert({
-      client_id: clientId,
-      attorney_id: resolvedAttorneyId,
-      title: `Notarial — ${serviceType || 'Service'}`,
-      notes: `Notarial payment checkout. ${marker}`,
-      scheduled_at: nowIso,
-      duration_minutes: 30,
-      status: 'pending',
-      amount: resolveNotarialAmount(amount),
-    })
-    .select('id, attorney_id, amount')
-    .single();
-
-  if (insertError) throw insertError;
-  return {
-    appointmentId: created.id,
-    attorneyId: created.attorney_id,
-    amount: resolveNotarialAmount(created.amount ?? amount),
-  };
-}
 
 async function fetchAdminUserIds() {
   const { data, error } = await supabase.from('profiles').select('id').eq('role', 'Admin');
@@ -160,51 +58,61 @@ async function insertNotificationsForUserIds(userIds, { title, body, type = 'gen
   if (error) throw error;
 }
 
-/** PayMongo via /payments/appointments/* (same hosted route as Book Appointment). */
+/**
+ * Web parity: PayMongo via POST /payments/notarial/create-session. The backend records the
+ * transaction against the notarial request and, once paid (status poll on
+ * /payments/appointments/status/:id), notifies admins/attorney and the client.
+ */
 export async function payForNotarialCheckout({
   notarialRequestId,
   clientId,
   attorneyId,
   amount,
   method,
-  methodTypes,
-  serviceType,
 }) {
-  let resolvedServiceType = serviceType;
-  let resolvedAmount = amount;
-  let resolvedAttorneyId = attorneyId;
+  if (!notarialRequestId || !clientId) {
+    throw new Error('Missing notarial request or client reference.');
+  }
 
-  if (resolvedAmount == null || resolvedServiceType == null) {
+  let resolvedAmount = amount;
+  let resolvedAttorneyId = attorneyId ?? null;
+
+  if (resolvedAmount == null || resolvedAttorneyId == null) {
     const row = await fetchNotarialPaymentDetails(notarialRequestId);
     if (resolvedAttorneyId == null) resolvedAttorneyId = row.attorneyId ?? null;
     if (resolvedAmount == null) resolvedAmount = row.amount;
-    if (resolvedServiceType == null) resolvedServiceType = row.serviceType ?? null;
   }
 
-  const booking = await ensureNotarialPaymentAppointment({
-    clientId,
-    notarialRequestId,
-    attorneyId: resolvedAttorneyId,
-    amount: resolvedAmount,
-    serviceType: resolvedServiceType,
+  const finalAmount = resolveNotarialAmount(resolvedAmount);
+  if (!(finalAmount > 0)) {
+    throw new Error('Invalid notarial payment amount.');
+  }
+
+  const payload = await requestPaymentApi('/payments/notarial/create-session', {
+    method: 'POST',
+    body: {
+      requestId: notarialRequestId,
+      clientId,
+      attorneyId: resolvedAttorneyId,
+      amount: finalAmount,
+      method: normalizeNotarialPaymentMethod(method),
+    },
   });
 
-  const session = await payForAppointment({
-    appointmentId: booking.appointmentId,
-    clientId,
-    attorneyId: booking.attorneyId,
-    amount: booking.amount,
-    method,
-    methodTypes,
-  });
+  if (!payload?.checkoutUrl || !payload?.transactionId) {
+    throw new Error('Payment provider returned an invalid session payload.');
+  }
 
   return {
-    ...session,
-    appointmentId: booking.appointmentId,
+    transactionId: payload.transactionId,
+    checkoutUrl: payload.checkoutUrl,
+    status: payload.status || 'pending',
+    checkoutSessionId: payload.checkoutSessionId || null,
     notarialRequestId,
   };
 }
 
+/** Bundled consultation + notarial: link the paid consultation transaction to the new notarial request. */
 export async function finalizeNotarialAfterPaidCheckout({
   notarialRequestId,
   clientId,

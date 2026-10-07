@@ -141,16 +141,3 @@ export async function getOrCreateVideoMeeting(appointmentId) {
 
   return { meetingId, roomId, token };
 }
-
-export async function clearVideoMeetingId(consultationRoomId) {
-  if (!consultationRoomId) {
-    return;
-  }
-  const { error } = await supabase
-    .from('consultation_rooms')
-    .update({ video_meeting_id: null })
-    .eq('id', consultationRoomId);
-  if (error) {
-    console.warn('[video] clearVideoMeetingId', error.message);
-  }
-}

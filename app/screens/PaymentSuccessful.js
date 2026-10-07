@@ -12,10 +12,11 @@ export default function PaymentSuccessful({navigation, route}) {
   const amount = route?.params?.amount || '₱2,500.00';
   const transactionId = route?.params?.transactionId || 'BTMS-UNKNOWN';
   const paymentContext = route?.params?.paymentContext || null;
+  const paymentMethodLabel = route?.params?.paymentMethodLabel || null;
+  const isStandaloneNotarial = paymentContext?.sourceType === 'notarial';
   // Determine if the user already bundled a notarial request
   const includeNotarial =
-    Boolean(paymentContext?.payload?.includeNotarial) ||
-    paymentContext?.sourceType === 'notarial';
+    Boolean(paymentContext?.payload?.includeNotarial) || isStandaloneNotarial;
 
   const handleBackToDashboard = () => {
     navigation.reset({
@@ -54,6 +55,9 @@ export default function PaymentSuccessful({navigation, route}) {
         <View style={styles.amountCard}>
           <Text style={styles.amountLabel}>AMOUNT PAID</Text>
           <Text style={styles.amountValue}>{amount}</Text>
+          {paymentMethodLabel ? (
+            <Text style={styles.methodText}>Paid via {paymentMethodLabel}</Text>
+          ) : null}
         </View>
 
         <Text style={styles.infoText}>
@@ -67,11 +71,12 @@ export default function PaymentSuccessful({navigation, route}) {
             <Text style={styles.notarialBadgeIcon}>📄</Text>
             <View style={styles.notarialBadgeTextGroup}>
               <Text style={styles.notarialBadgeTitle}>
-                Notarial Request Submitted
+                {isStandaloneNotarial ? 'Notarial Payment Received' : 'Notarial Request Submitted'}
               </Text>
               <Text style={styles.notarialBadgeHint}>
-                Your notarization request has been bundled with this booking.
-                Track it under Menu → Notary Status.
+                {isStandaloneNotarial
+                  ? 'Your notarial request is now in the notary queue. Track it under Menu → Notary Status.'
+                  : 'Your notarization request has been bundled with this booking. Track it under Menu → Notary Status.'}
               </Text>
             </View>
           </View>
@@ -190,6 +195,12 @@ const styles = StyleSheet.create({
     color: T.gold[0],
     fontSize: 36,
     fontWeight: 'bold',
+  },
+  methodText: {
+    color: T.textSoft,
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 6,
   },
   infoText: {
     fontSize: 14,

@@ -12,7 +12,7 @@ import {
   Modal,
   ScrollView,
 } from 'react-native';
-import {useFocusEffect} from '@react-navigation/native';
+import {useFocusEffect, useIsFocused} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {MaterialCommunityIcons} from '@expo/vector-icons';
 import {ClientScreenShell} from '../components/ClientScreenShell';
@@ -94,6 +94,7 @@ const MessageBubble = ({item}) => {
 
 export default function ConsultationChat({navigation, route}) {
   const insets = useSafeAreaInsets();
+  const isFocused = useIsFocused();
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState([]);
   const [isClosed, setIsClosed] = useState(false);
@@ -450,6 +451,19 @@ export default function ConsultationChat({navigation, route}) {
     setIncomingMeetingId(null);
     autoOpenedMeetingIdRef.current = meetingId;
   };
+
+  // Web parity: auto-open the call once when the client starts it; the banner stays as the fallback/rejoin.
+  useEffect(() => {
+    if (!isFocused || isClosed || !incomingMeetingId) return;
+    if (autoOpenedMeetingIdRef.current === incomingMeetingId) return;
+    autoOpenedMeetingIdRef.current = incomingMeetingId;
+    joinIncomingVideoCall(incomingMeetingId);
+  }, [isFocused, isClosed, incomingMeetingId, joinIncomingVideoCall]);
+
+  useEffect(() => {
+    if (isClosed) return;
+    getVideoSdkToken().catch(() => {});
+  }, [isClosed]);
 
   const handleEndConsultation = () => {
     Alert.alert(
