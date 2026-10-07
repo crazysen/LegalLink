@@ -15,6 +15,12 @@ import {REFERENCE_THEME as T} from '../constants/referenceTheme';
 import {ClientScreenShell, ClientFadeIn} from '../components/ClientScreenShell';
 import ClientChevronBack from '../components/ClientChevronBack';
 import {createNotarialRequest} from '../services/notarialService';
+import {warmPaymentBackend} from '../services/paymentApiClient';
+import {
+  NOTARIAL_SERVICE_FEE,
+  formatNotarialFeePhp,
+  resolveNotarialAmount,
+} from '../constants/notarialFees';
 
 const HEADER_BACK_COL = 28;
 const HEADER_BACK_GAP = 8;
@@ -85,54 +91,58 @@ const NewRequestForm = ({navigation}) => {
     }
   };
 
-  const handleSubmit = async () => {
+  const handleProceedToPayment = async () => {
     if (!serviceType.trim()) {
       Alert.alert('Error', 'Type of document is required.');
       return;
     }
     if (!documentFile?.uri) {
-      Alert.alert('Error', 'Please upload a document before submitting.');
+      Alert.alert('Error', 'Please upload a document before proceeding to payment.');
       return;
     }
 
     try {
       setSubmitting(true);
+      warmPaymentBackend().catch(() => {});
 
-      let documentBase64 = null;
-      if (documentFile?.uri) {
-        documentBase64 = await FileSystem.readAsStringAsync(documentFile.uri, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
-      }
+      const documentBase64 = await FileSystem.readAsStringAsync(documentFile.uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
 
       const created = await createNotarialRequest({
         service_type: serviceType.trim(),
         details: details.trim() || null,
-        document_name: documentFile?.name || null,
+        document_name: documentFile.name || null,
         document_base64: documentBase64,
+        amount: NOTARIAL_SERVICE_FEE,
       });
 
       if (!created?.id) {
         throw new Error('Could not save your request. Please try again.');
       }
 
-      setSubmitting(false);
+      const amount = resolveNotarialAmount(created.amount);
       setDocumentFile(null);
       setDetails('');
 
-      Alert.alert(
-        'Request submitted',
-        'Your request is now Pending review. Payment opens once it is approved, and you can track every step under Notary Status.',
-        [
-          {
-            text: 'Go to Notary Status',
-            onPress: () => navigation.navigate('ClientNotaryStatus'),
-          },
-        ],
-      );
+      navigation.navigate('Payment', {
+        paymentMethod: 'qrph',
+        serviceData: {
+          type: created.service_type || serviceType.trim(),
+          amount: formatNotarialFeePhp(amount),
+        },
+        paymentContext: {
+          sourceType: 'notarial',
+          sourceId: created.id,
+          attorneyId: created.attorney_id ?? null,
+          amount,
+          fromNewRequest: true,
+        },
+      });
     } catch (error) {
+      Alert.alert('Error', error?.message ?? 'Unable to start payment.');
+    } finally {
       setSubmitting(false);
-      Alert.alert('Error', error?.message ?? 'Unable to submit request.');
     }
   };
 
@@ -164,17 +174,40 @@ const NewRequestForm = ({navigation}) => {
         onChangeText={setDetails}
       />
 
+      <View style={styles.summaryBox}>
+        <View style={styles.summaryRow}>
+          <Text style={styles.summaryLabel}>Service</Text>
+          <Text style={styles.summaryValue}>{serviceType}</Text>
+        </View>
+        <View style={styles.summaryRow}>
+          <Text style={styles.summaryLabel}>Document</Text>
+          <Text style={styles.summaryValue} numberOfLines={1}>
+            {documentFile?.name || '—'}
+          </Text>
+        </View>
+        <View style={styles.summaryRow}>
+          <Text style={styles.summaryLabel}>Amount due</Text>
+          <Text style={styles.summaryAmount}>
+            {formatNotarialFeePhp(NOTARIAL_SERVICE_FEE)}
+          </Text>
+        </View>
+        <Text style={styles.summaryNote}>
+          You will pay with QR Ph on the PayMongo page.
+        </Text>
+      </View>
+
       <TouchableOpacity
-        style={styles.submitButton}
-        onPress={handleSubmit}
+        style={[styles.submitButton, submitting && styles.submitButtonDisabled]}
+        onPress={handleProceedToPayment}
         disabled={submitting}>
         <Text style={styles.submitButtonText}>
-          {submitting ? 'Submitting...' : 'Submit Request'}
+          {submitting ? 'Opening payment...' : 'Proceed to Payment'}
         </Text>
       </TouchableOpacity>
 
       <Text style={styles.trackHint}>
-        After submitting, track progress under Menu → Notary Status.
+        Your file is saved before payment. If you leave PayMongo, finish paying anytime under
+        Menu → Notary Status.
       </Text>
     </View>
   );
@@ -261,7 +294,27 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginTop: 25,
   },
+  submitButtonDisabled: {opacity: 0.6},
   submitButtonText: {color: T.base, fontWeight: '700', fontSize: 16},
+  summaryBox: {
+    marginTop: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.15)',
+    borderRadius: 12,
+    padding: 14,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+  },
+  summaryRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+    gap: 12,
+  },
+  summaryLabel: {fontSize: 13, color: T.textSoft},
+  summaryValue: {flexShrink: 1, fontSize: 13, fontWeight: '700', color: T.text, textAlign: 'right'},
+  summaryAmount: {fontSize: 14, fontWeight: '800', color: T.gold[0]},
+  summaryNote: {fontSize: 11, color: T.textSoft, marginTop: 2, lineHeight: 16},
   trackHint: {
     marginTop: 16,
     fontSize: 12,

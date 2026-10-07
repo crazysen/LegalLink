@@ -48,25 +48,13 @@ export function buildNotarialWorkflow(req, options = {}) {
   }
 
   if (!paid) {
-    // Web parity: payment only opens once the request is approved.
-    if (!isApproved(status)) {
-      return {
-        phase: 'review',
-        label: 'Waiting for review',
-        tone: 'warn',
-        summary:
-          'Your request was submitted. Payment opens once an attorney approves it.',
-        stepIndex: 0,
-        needsPayment: false,
-      };
-    }
-
+    // Web parity: the file is saved first and payment opens right away (no approval gate).
     return {
       phase: isMobile ? 'payment' : 'mobile',
       label: isMobile ? 'Payment pending' : 'Continue on mobile',
       tone: 'warn',
       summary: isMobile
-        ? 'Your request was approved. Complete payment to move it into the notarization queue.'
+        ? 'Your file is saved. Complete payment to move your request into the notarization queue.'
         : 'Finish payment in the LegalLink mobile app.',
       stepIndex: 0,
       needsPayment: isMobile,

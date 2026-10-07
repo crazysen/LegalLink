@@ -1,7 +1,7 @@
 import { supabase } from './supabaseClient';
 import { requestPaymentApi } from './paymentApiClient';
 import { resolveNotarialAmount } from '../constants/notarialFees';
-import { normalizeNotarialPaymentMethod } from '../constants/paymentConfig';
+import { DEFAULT_PAYMENT_METHOD } from '../constants/paymentConfig';
 
 async function fetchNotarialPaymentDetails(requestId) {
   const { data, error } = await supabase
@@ -68,7 +68,6 @@ export async function payForNotarialCheckout({
   clientId,
   attorneyId,
   amount,
-  method,
 }) {
   if (!notarialRequestId || !clientId) {
     throw new Error('Missing notarial request or client reference.');
@@ -95,7 +94,7 @@ export async function payForNotarialCheckout({
       clientId,
       attorneyId: resolvedAttorneyId,
       amount: finalAmount,
-      method: normalizeNotarialPaymentMethod(method),
+      method: DEFAULT_PAYMENT_METHOD,
     },
   });
 

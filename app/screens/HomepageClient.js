@@ -230,7 +230,7 @@ const HomepageClient = ({navigation}) => {
               animateIcon
               icon="calendar-check"
               title="Book New Appointment"
-              subtitle="Schedule a session with verified counsel."
+              subtitle="Schedule a consultation with our expert attorneys"
               onPress={handleBookAppointment}
             />
           </ClientFadeInSoft>
@@ -239,8 +239,8 @@ const HomepageClient = ({navigation}) => {
             <KineticClientCard
               animateIcon
               icon="shield-check-outline"
-              title="Request Notarial Services"
-              subtitle="Legally binding document authentication."
+              title="Request Notary"
+              subtitle="Submit and pay for notary requests online"
               onPress={handleNotarialService}
             />
           </ClientFadeInSoft>

@@ -386,8 +386,8 @@ export default function ClientNotaryStatus({navigation}) {
             <Text style={styles.heroEyebrow}>Notary services</Text>
             <Text style={styles.heroTitle}>Track your notary requests</Text>
             <Text style={styles.heroBody}>
-              Status updates sync with the web dashboard. Submit your document, wait for
-              approval, then pay to move your request into the notarization queue.
+              Status updates sync with the web dashboard. Upload your document and pay to
+              move your request into the notarization queue.
             </Text>
           </View>
         </ClientFadeInSoft>
@@ -397,7 +397,7 @@ export default function ClientNotaryStatus({navigation}) {
             animateIcon
             icon="file-certificate"
             title="New notary request"
-            subtitle="Upload your document and submit it for review."
+            subtitle="Upload your document and proceed to payment."
             onPress={() => navigation.navigate('ClientNotarial')}
           />
         </ClientFadeInSoft>
