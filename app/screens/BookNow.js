@@ -125,6 +125,10 @@ export default function BookNow({navigation, route}) {
   }, [fetchAvailableSlots]);
 
   useEffect(() => {
+    warmPaymentBackend().catch(() => {});
+  }, []);
+
+  useEffect(() => {
     if (!attorney?.id) return undefined;
     const unsubscribe = subscribeToAvailabilitySlots(payload => {
       const changedRow = payload?.new || payload?.old || {};

@@ -16,7 +16,7 @@ import ClientChevronBack from '../components/ClientChevronBack';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
 import {getMyAppointments} from '../services/appointmentService';
 import {getNotarialRequests} from '../services/notarialService';
-import {supabase} from '../services/supabaseClient';
+import {supabase, getSessionUser} from '../services/supabaseClient';
 
 const NOTARIAL_FEE_FALLBACK = 4000;
 
@@ -165,9 +165,7 @@ export default function MyEarnings({navigation}) {
   const [rows, setRows] = useState([]);
 
   const load = useCallback(async () => {
-    const {
-      data: {user},
-    } = await supabase.auth.getUser();
+    const user = await getSessionUser();
     if (!user?.id) {
       setRows([]);
       return;

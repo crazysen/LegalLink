@@ -1,4 +1,4 @@
-import { supabase } from './supabaseClient';
+import { supabase, getSessionUser } from './supabaseClient';
 import { notifyAdminsOfNewNotarialRequest } from './userApi';
 import { resolveNotarialAmount } from '../constants/notarialFees';
 
@@ -66,10 +66,11 @@ function safePathSegment(name) {
     .slice(0, 120) || 'file';
 }
 
-async function uploadBase64ToDocuments(userId, base64, filename, role) {
+async function uploadBase64ToDocuments(userId, base64OrBytes, filename, role) {
   const ext = String(filename || '').split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
   const path = `${userId}/${Date.now()}_${role}_${safePathSegment(filename)}.${ext}`;
-  const buffer = base64ToArrayBuffer(base64);
+  const buffer =
+    typeof base64OrBytes === 'string' ? base64ToArrayBuffer(base64OrBytes) : base64OrBytes;
   const { error: uploadError } = await supabase.storage
     .from(STORAGE_BUCKET)
     .upload(path, buffer, {
@@ -89,7 +90,7 @@ async function uploadBase64ToDocuments(userId, base64, filename, role) {
 }
 
 export async function getNotarialRequests() {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) return [];
 
   const { data, error } = await supabase
@@ -138,18 +139,19 @@ export async function getNotarialRequests() {
 }
 
 export async function createNotarialRequest(payload) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error("Not authenticated");
 
   let documentUrl = payload.document_url ? String(payload.document_url).trim() : '';
 
   // Run both uploads in parallel to cut wait time roughly in half
+  const mainDocument = payload.document_bytes || payload.document_base64;
   const [mainUrl, idUrl, idBackUrl] = await Promise.all([
-    documentUrl || !payload.document_base64
+    documentUrl || !mainDocument
       ? Promise.resolve(documentUrl)
       : uploadBase64ToDocuments(
           user.id,
-          payload.document_base64,
+          mainDocument,
           payload.document_name || 'notarial-document.pdf',
           'main',
         ),
@@ -215,7 +217,7 @@ export async function createNotarialRequest(payload) {
 
   if (error) throw new Error(error.message);
 
-  await notifyAdminsOfNewNotarialRequest({
+  notifyAdminsOfNewNotarialRequest({
     clientId: user.id,
     serviceType: payload.service_type,
     preferredDate,
@@ -226,7 +228,7 @@ export async function createNotarialRequest(payload) {
 
 /** Web parity: a client may swap the uploaded file while the request is still unpaid. */
 export async function replaceNotarialRequestDocument({requestId, documentBase64, documentName}) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
   if (!requestId) throw new Error('Missing request.');
   if (!documentBase64) throw new Error('No document to upload.');

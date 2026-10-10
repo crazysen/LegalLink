@@ -1,5 +1,5 @@
 import { readAsStringAsync } from 'expo-file-system/legacy';
-import { supabase } from './supabaseClient';
+import { supabase, getSessionUser } from './supabaseClient';
 import { completeAppointmentAfterConsultationEnded } from './appointmentService';
 import { bucketForMessageType, validateAttachment } from './chatTypes';
 
@@ -113,7 +113,7 @@ function mapRow(row, roomId, isClosed, userId) {
  * @returns {Promise<{ rows: ReturnType<typeof mapRow>[], isClosed: boolean, roomId: string | null, videoMeetingId: string | null }>}
  */
 export async function getAppointmentMessages(appointmentId) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const { data, error } = await supabase
@@ -167,9 +167,7 @@ export async function getAppointmentMessages(appointmentId) {
  * Attorney-only: closes consultation room, clears video meeting, marks appointment completed.
  */
 export async function endConsultationSession(appointmentId) {
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
 
   if (!user) throw new Error('Not authenticated');
   if (!appointmentId) throw new Error('Appointment is required.');
@@ -227,9 +225,7 @@ export async function closeConsultationRoom(appointmentId) {
 }
 
 export async function notifyClientConsultationTimeWarning(appointmentId) {
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
 
   if (!user) throw new Error('Not authenticated');
   if (!appointmentId) throw new Error('Appointment is required.');
@@ -287,9 +283,7 @@ export async function saveAttorneyConsultationBranch({appointmentId, branch}) {
   const trimmed = String(branch || '').trim()
   if (!trimmed) throw new Error('Please select a consultation branch.')
 
-  const {
-    data: {user},
-  } = await supabase.auth.getUser()
+  const user = await getSessionUser()
   if (!user?.id) throw new Error('Not authenticated')
 
   const {data: appt, error: fetchError} = await supabase
@@ -317,7 +311,7 @@ export async function saveAttorneyConsultationBranch({appointmentId, branch}) {
 }
 
 export async function sendAppointmentMessage(appointmentId, text) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const room = await getOrCreateRoom(appointmentId);
@@ -348,7 +342,7 @@ export async function sendAppointmentMessage(appointmentId, text) {
  * @param {{ uri: string, fileName: string, mime: string, size: number, caption?: string }} asset
  */
 export async function uploadAndSendChatAttachment(appointmentId, asset) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const mime = String(asset.mime || 'application/octet-stream').toLowerCase();
@@ -425,7 +419,7 @@ export async function getSignedUrlForMessage(msg) {
  * @returns {Promise<() => void>}
  */
 export async function subscribeToConsultationRoom(appointmentId, callbacks) {
-  const {data: {user}} = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const room = await getOrCreateRoom(appointmentId);

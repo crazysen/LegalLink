@@ -1,7 +1,7 @@
-import { supabase } from './supabaseClient';
+import { supabase, getSessionUser } from './supabaseClient';
 
 export async function getAvailability() {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const { data, error } = await supabase
@@ -14,7 +14,7 @@ export async function getAvailability() {
 }
 
 export async function createAvailabilitySlot({start_time, end_time}) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
   
   try {

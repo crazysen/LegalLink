@@ -6,27 +6,23 @@ import {
   Image,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
 import {getMyAppointments} from '../services/appointmentService';
-import {ensureAppConfigLoaded} from '../services/userApi';
+import {ensureAppConfigReady} from '../services/userApi';
 import {REFERENCE_THEME as T} from '../constants/referenceTheme';
 import {ClientScreenShell, ClientFadeIn} from '../components/ClientScreenShell';
 import ClientChevronBack from '../components/ClientChevronBack';
 
 const MessagesHub = ({ navigation }) => {
-  // State for search query
-  const [searchQuery, setSearchQuery] = useState('');
-  
   const [appointments, setAppointments] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const loadAppointments = useCallback(async () => {
     try {
       setLoading(true);
-      await ensureAppConfigLoaded();
+      await ensureAppConfigReady();
       const rows = await getMyAppointments({force: true});
       setAppointments(Array.isArray(rows) ? rows : []);
     } catch (error) {
@@ -73,18 +69,6 @@ const MessagesHub = ({ navigation }) => {
     [appointments],
   );
 
-  // Filter chat data based on search query
-  const filteredChatData = useMemo(() => {
-    if (!searchQuery.trim()) {
-      return chatData;
-    }
-    const query = searchQuery.toLowerCase();
-    return chatData.filter(chat => 
-      chat.name.toLowerCase().includes(query) || 
-      chat.msg.toLowerCase().includes(query)
-    );
-  }, [searchQuery, chatData]);
-
   // Handle chat item press
   const handleChatPress = (chat) => {
     if (!chat.chatAccessible) {
@@ -104,16 +88,6 @@ const MessagesHub = ({ navigation }) => {
       // Fallback if navigation is not available
       Alert.alert('Open Chat', `Opening chat with ${chat.name}`);
     }
-  };
-
-  // Handle search input change
-  const handleSearchChange = (text) => {
-    setSearchQuery(text);
-  };
-
-  // Clear search
-  const handleClearSearch = () => {
-    setSearchQuery('');
   };
 
   const ChatItem = ({ item }) => (
@@ -150,8 +124,9 @@ const MessagesHub = ({ navigation }) => {
     <ClientScreenShell>
       <ClientFadeIn>
       <View style={styles.header}>
-        <ClientChevronBack style={styles.backHit} onPress={handleBack} />
-        <Text style={styles.brand}>LEGALLINK HUB</Text>
+        <View style={styles.backColumn}>
+          <ClientChevronBack onPress={handleBack} />
+        </View>
         <Text style={styles.title}>Messages</Text>
       </View>
 
@@ -176,22 +151,6 @@ const MessagesHub = ({ navigation }) => {
         <Text style={styles.adminSupportChevron}>›</Text>
       </TouchableOpacity>
 
-      <View style={styles.searchContainer}>
-        <Text style={styles.searchIcon}>🔍</Text>
-        <TextInput 
-          style={styles.searchInput} 
-          placeholder="Search encrypted sessions..." 
-          placeholderTextColor={T.textSoft}
-          value={searchQuery}
-          onChangeText={handleSearchChange}
-        />
-        {searchQuery.length > 0 && (
-          <TouchableOpacity onPress={handleClearSearch} style={styles.clearButton}>
-            <Text style={styles.clearText}>✕</Text>
-          </TouchableOpacity>
-        )}
-      </View>
-
       {loading ? (
         <View style={styles.emptyContainer}>
           <ActivityIndicator color={T.gold[1]} />
@@ -200,7 +159,7 @@ const MessagesHub = ({ navigation }) => {
       ) : (
         <FlatList
           style={styles.listFlex}
-          data={filteredChatData}
+          data={chatData}
           renderItem={({ item }) => <ChatItem item={item} />}
           keyExtractor={item => item.id}
           contentContainerStyle={{ padding: 16 }}
@@ -218,25 +177,25 @@ const MessagesHub = ({ navigation }) => {
 
 const styles = StyleSheet.create({
   listFlex: {flex: 1},
-  header: { 
-    padding: 20 
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: 16,
   },
-  backHit: {
-    marginBottom: 10,
-    alignSelf: 'flex-start',
+  backColumn: {
+    width: 28,
+    marginRight: 8,
+    justifyContent: 'center',
+    alignItems: 'flex-start',
   },
-  brand: { 
-    color: T.gold[0], 
-    fontSize: 12, 
-    fontWeight: 'bold', 
-    letterSpacing: 1 
-  },
-  title: { 
-    color: 'white', 
-    fontSize: 36, 
-    fontFamily: 'serif', 
-    fontWeight: 'bold', 
-    marginTop: 8 
+  title: {
+    flex: 1,
+    color: T.text,
+    fontSize: 22,
+    fontWeight: '800',
+    lineHeight: 28,
   },
   adminSupportBanner: {
     flexDirection: 'row',
@@ -281,34 +240,6 @@ const styles = StyleSheet.create({
     fontSize: 22,
     fontWeight: '300',
     marginLeft: 6,
-  },
-  searchContainer: { 
-    flexDirection: 'row', 
-    backgroundColor: '#0F172A', 
-    margin: 16, 
-    borderRadius: 12, 
-    paddingHorizontal: 16, 
-    alignItems: 'center', 
-    height: 56, 
-    borderWidth: 1, 
-    borderColor: '#1E293B' 
-  },
-  searchIcon: { 
-    marginRight: 12 
-  },
-  searchInput: { 
-    flex: 1, 
-    color: 'white',
-    fontSize: 14
-  },
-  clearButton: {
-    padding: 8,
-    marginLeft: 8
-  },
-  clearText: {
-    color: '#64748B',
-    fontSize: 18,
-    fontWeight: 'bold'
   },
   chatCard: { 
     flexDirection: 'row', 

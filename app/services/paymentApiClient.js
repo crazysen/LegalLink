@@ -227,13 +227,17 @@ async function requestPaymentApiHttpOnBase(baseUrl, path, { method = 'GET', body
 }
 
 let paymentWarmupPromise = null;
+let paymentBackendWarmAt = 0;
+const PAYMENT_WARM_REUSE_MS = 5 * 60 * 1000;
 
 /**
  * Wake Render / local payment API before create-session (reduces cold-start delay).
- * Safe to call multiple times; concurrent callers share one in-flight request.
+ * Fire-and-forget: never await this on the pay path. Concurrent callers share one
+ * in-flight request, and a recent successful ping is reused.
  */
 export async function warmPaymentBackend() {
   if (paymentWarmupPromise) return paymentWarmupPromise;
+  if (Date.now() - paymentBackendWarmAt < PAYMENT_WARM_REUSE_MS) return undefined;
 
   paymentWarmupPromise = (async () => {
     const bases = buildPaymentBaseUrls();
@@ -244,10 +248,11 @@ export async function warmPaymentBackend() {
       await Promise.all(
         bases.map(async (baseUrl) => {
           try {
-            await fetch(`${baseUrl}/health`, {
+            const res = await fetch(`${baseUrl}/health`, {
               method: 'GET',
               signal: controller.signal,
             });
+            if (res.ok) paymentBackendWarmAt = Date.now();
           } catch {
             // ignore — warmup is best-effort
           }

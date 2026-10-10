@@ -20,6 +20,7 @@ import {getMyProfile} from '../services/profileService';
 import {registerClientPushNotifications} from '../services/pushNotificationService';
 import {
   fetchClientConsultationQueue,
+  getCurrentUserId,
   subscribeToClientAppointments,
 } from '../services/userApi';
 import {getGreetingName} from '../utils/userDisplayName';
@@ -39,8 +40,7 @@ const HomepageClient = ({navigation}) => {
         if (!force) setLoadingQueue(true);
         let userId = clientId;
         if (!userId) {
-          const data = await getMyProfile();
-          userId = data?.id;
+          userId = await getCurrentUserId();
           if (userId) setClientId(userId);
         }
         if (!userId) {

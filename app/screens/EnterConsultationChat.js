@@ -45,7 +45,7 @@ import {
   getOrCreateVideoMeeting,
   getVideoSdkToken,
 } from '../services/videoMeetingService';
-import {ensureAppConfigLoaded, getCurrentSessionProfile} from '../services/userApi';
+import {ensureAppConfigReady, getCurrentSessionProfile} from '../services/userApi';
 import {useUserProfile} from '../context/UserProfileContext';
 import {
   attachConsultationChatPresence,
@@ -97,7 +97,7 @@ const ConsultationChat = ({navigation, route}) => {
       let cancelled = false;
       (async () => {
         try {
-          await ensureAppConfigLoaded();
+          await ensureAppConfigReady();
           if (!threadId || threadId === 'general-chat') return;
           const rows = await getMyAppointments({force: true});
           if (cancelled) return;

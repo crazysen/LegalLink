@@ -1,4 +1,4 @@
-import {supabase} from './supabaseClient';
+import {supabase, getSessionUser} from './supabaseClient';
 
 /**
  * @param {string} appointmentId
@@ -20,7 +20,7 @@ export async function hasFeedbackForAppointment(appointmentId) {
  * @param {{ rating: number, comment?: string }} payload
  */
 export async function submitConsultationFeedback(appointmentId, payload) {
-  const {data: {user}} = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const rating = Number(payload?.rating);

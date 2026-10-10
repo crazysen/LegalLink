@@ -1,6 +1,6 @@
 import {IS_ANDROID} from '../constants/platformUi';
 import Constants, {ExecutionEnvironment} from 'expo-constants';
-import {supabase} from './supabaseClient';
+import {supabase, getSessionUser} from './supabaseClient';
 
 // Remote push is not available in Expo Go (SDK 53+). Do not import expo-notifications at all there,
 // or the runtime will log an error even if we never call getExpoPushTokenAsync.
@@ -79,9 +79,7 @@ export async function registerClientPushNotifications() {
     return null;
   }
 
-  const {
-    data: {user},
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) {
     return null;
   }

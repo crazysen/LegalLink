@@ -16,6 +16,7 @@ import { ClientScreenShell, ClientFadeInSoft } from '../components/ClientScreenS
 import ClientChevronBack from '../components/ClientChevronBack';
 import {
   getCurrentSessionProfile,
+  getCurrentUserId,
   createAppointmentBooking,
   createNotarialRequest,
   markNotarialRequestPaid,
@@ -91,6 +92,16 @@ export default function Payment({navigation, route}) {
 
   const getPaymentMethodLabel = () => 'QR Ph';
 
+  const resolveClientId = async () => {
+    if (clientIdRef.current) return clientIdRef.current;
+    const clientId = await getCurrentUserId();
+    if (!clientId) {
+      throw new Error('You must be signed in to complete payment.');
+    }
+    clientIdRef.current = clientId;
+    return clientId;
+  };
+
 
   const ensureAppointmentBooking = async () => {
     if (appointmentIdRef.current) {
@@ -110,12 +121,7 @@ export default function Payment({navigation, route}) {
     }
 
     bookingPromiseRef.current = (async () => {
-      const { profile } = await getCurrentSessionProfile();
-      const clientId = profile?.id;
-      if (!clientId) {
-        throw new Error('You must be signed in to complete payment.');
-      }
-      clientIdRef.current = clientId;
+      const clientId = await resolveClientId();
 
       const payload = paymentContext.payload || {};
       if (!payload.attorney_id || !payload.slot_id) {
@@ -250,13 +256,7 @@ export default function Payment({navigation, route}) {
   };
 
   const buildPaymongoSession = async () => {
-    const profilePromise = getCurrentSessionProfile();
-    const { profile } = await profilePromise;
-    const clientId = profile?.id;
-    if (!clientId) {
-      throw new Error('You must be signed in to complete payment.');
-    }
-    clientIdRef.current = clientId;
+    const clientId = await resolveClientId();
 
     if (paymentContext?.sourceType === 'notarial') {
       if (!paymentContext?.sourceId) {
@@ -269,7 +269,6 @@ export default function Payment({navigation, route}) {
         if (attorneyId == null) attorneyId = row.attorneyId ?? null;
         amount = row.amount;
       }
-      await warmPaymentBackend();
 
       const session = await payForNotarialCheckout({
         notarialRequestId: paymentContext.sourceId,
@@ -306,8 +305,6 @@ export default function Payment({navigation, route}) {
       if (attorneyId == null) attorneyId = row.attorneyId;
       if (amount == null) amount = row.amount;
     }
-
-    await warmPaymentBackend();
 
     const session = await payForAppointment({
       appointmentId,
@@ -475,18 +472,13 @@ export default function Payment({navigation, route}) {
       setIsPaying(true);
       setPaymentStatus('pending');
 
-      const { profile } = await getCurrentSessionProfile();
-      const clientId = profile?.id;
-      if (!clientId) {
-        throw new Error('You must be signed in to complete payment.');
-      }
-      clientIdRef.current = clientId;
-
-      await warmPaymentBackend();
-
+      const sessionStartedAt = Date.now();
       // Notarial: fresh session per attempt so a retry never reuses a cancelled checkout.
       const session =
         (!isNotarialPay && checkoutSession) || (await buildPaymongoSession());
+      if (__DEV__) {
+        console.log(`[pay-timing] PayMongo checkout ready in ${Date.now() - sessionStartedAt}ms`);
+      }
       if (!session?.checkoutUrl) {
         throw new Error('Checkout URL is missing. Please try again.');
       }
@@ -525,7 +517,6 @@ export default function Payment({navigation, route}) {
     prefetchStartedRef.current = true;
     setSessionPreparing(true);
     try {
-      await warmPaymentBackend();
       await buildPaymongoSession();
     } catch (error) {
       console.warn('[payment] prefetch session failed', error?.message || error);

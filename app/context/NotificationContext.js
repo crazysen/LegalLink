@@ -8,6 +8,7 @@ import React, {
 } from 'react';
 import {supabase} from '../services/supabaseClient';
 import {parseNotificationImageUrl} from '../services/announcementImages';
+import {stripNotificationMarkers} from '../services/notificationText';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Context definition
@@ -34,6 +35,7 @@ function normalizeNotificationRow(item) {
     payload.appointment_id || payload.appointmentId || payload.appointment || null;
   return {
     ...item,
+    body: stripNotificationMarkers(item.body),
     appointmentId: appointmentId ? String(appointmentId) : null,
     imageUrl: parseNotificationImageUrl(payload),
   };
@@ -156,21 +158,13 @@ export function NotificationProvider({children}) {
   useEffect(() => {
     let cancelled = false;
 
-    const init = async () => {
-      const {data: {session}} = await supabase.auth.getSession();
-      if (cancelled) return;
-      if (session?.user?.id) {
-        userIdRef.current = session.user.id;
-        fetchNotifications(session.user.id);
-        subscribeRealtime(session.user.id);
-      }
-    };
-    init();
-
+    // INITIAL_SESSION fires on subscribe, so no separate getSession() bootstrap is needed.
+    // Token refreshes keep the same user — skip refetch/resubscribe for those.
     const {data: authListener} = supabase.auth.onAuthStateChange(
       (_event, session) => {
         if (cancelled) return;
         const uid = session?.user?.id ?? null;
+        if (uid && uid === userIdRef.current && channelRef.current) return;
         userIdRef.current = uid;
         if (uid) {
           fetchNotifications(uid);

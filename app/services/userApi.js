@@ -1,5 +1,6 @@
 import { readAsStringAsync } from 'expo-file-system/legacy';
-import { supabase } from './supabaseClient';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { supabase, getSessionUser, SUPABASE_URL, SUPABASE_ANON_KEY } from './supabaseClient';
 import { signOutCurrentUser } from './authService';
 import {
   clearMemoryProfileCache,
@@ -14,6 +15,7 @@ import { requestPaymentApi } from './paymentApiClient';
 import { getBundledAttorneyPhotoUri } from '../constants/attorneyPhotos';
 import { resolveNotarialAmount } from '../constants/notarialFees';
 import { parseNotificationImageUrl } from './announcementImages';
+import { stripNotificationMarkers } from './notificationText';
 import {
   formatHourLabel,
   sortAvailabilitySlotsChronologically,
@@ -451,6 +453,14 @@ export function clearCachedProfile() {
   invalidateAttorneyProfileCache();
 }
 
+/** Signed-in user id from the locally stored session (no profile query). */
+export async function getCurrentUserId() {
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
+  return session?.user?.id || null
+}
+
 export async function getCurrentSessionProfile() {
   const {
     data: { session },
@@ -650,6 +660,7 @@ function mapRowToClientConsultationQueueItem(item, paymentStatus) {
       scheduledAt: item.scheduled_at,
       slotDate: derivedSlotDate,
       slotTime: derivedSlotTime,
+      paymentStatus,
     }),
   }
 }
@@ -683,6 +694,7 @@ export async function fetchClientConsultationQueue(userId, options = {}) {
       .from('transactions')
       .select('appointment_id, payment_status')
       .eq('client_id', userId),
+    ensureAppConfigReady(),
   ])
 
   if (appointmentsRes.error) throw appointmentsRes.error
@@ -725,7 +737,7 @@ export async function fetchClientHomeData(userId) {
     id: n.id,
     type: n.type || 'general',
     title: n.title,
-    desc: n.body,
+    desc: stripNotificationMarkers(n.body),
     time: n.created_at ? new Date(n.created_at).toLocaleString() : 'Now',
     read: n.is_read,
   }))
@@ -1029,12 +1041,31 @@ export const buildChatScheduleBlockedMessage = ({ scheduledAt, slotDate, slotTim
 export const isConsultationChatActiveStatus = (status) =>
   CHAT_ACTIVE_APPOINTMENT_STATUSES.has(String(status || '').toLowerCase())
 
+const isPaidPaymentStatus = (paymentStatus) =>
+  paymentStatus === true || String(paymentStatus || '').trim().toLowerCase() === 'paid'
+
 /**
  * Web parity for testing: room opens any hour on the scheduled calendar day
  * (Asia/Manila), not only at the exact slot time. Blocked on earlier days.
+ * When admins turn off "Enforce Scheduled Chat Time" (app_config.enforce_schedule_window),
+ * paid consultations can be entered any day.
  */
-export const isConsultationChatWindowOpen = ({ status, scheduledAt, slotDate, slotTime, nowValue } = {}) => {
+export const isConsultationChatWindowOpen = ({
+  status,
+  scheduledAt,
+  slotDate,
+  slotTime,
+  paymentStatus,
+  nowValue,
+} = {}) => {
   if (!isConsultationChatActiveStatus(status)) return false
+
+  if (
+    !isAppConfigFlagOn('enforce_schedule_window', true) &&
+    isPaidPaymentStatus(paymentStatus)
+  ) {
+    return true
+  }
 
   const scheduled = parseChatScheduleDate({ scheduledAt, slotDate, slotTime })
   if (!scheduled) return false
@@ -1297,9 +1328,7 @@ export async function sendClientSupportMessage({ clientId, message }) {
   const body = String(message || '').trim()
   if (!body) throw new Error('Message cannot be empty.')
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  const user = await getSessionUser()
   if (!user?.id) throw new Error('Not authenticated.')
   if (String(user.id) !== String(clientId)) {
     throw new Error('You can only send messages from your own account.')
@@ -1967,7 +1996,7 @@ export async function fetchAttorneyConsultationRequests(userId) {
   const [requestsRes, notificationsRes] = await Promise.all([
     supabase
       .from('appointments')
-      .select('id, title, scheduled_at, status, notes, client_id, client:client_id(full_name), amount')
+      .select('id, title, scheduled_at, status, notes, client_id, client:client_id(full_name), amount, transactions(payment_status)')
       .eq('attorney_id', userId)
       .in('status', ['pending', 'rescheduled', 'confirmed'])
       .order('scheduled_at', { ascending: true }),
@@ -1985,6 +2014,12 @@ export async function fetchAttorneyConsultationRequests(userId) {
   const requests = (requestsRes.data || []).map((item) => {
     const datetime = formatDateTime(item.scheduled_at)
     const status = normalizeAppointmentStatus(item.status)
+    const transactions = Array.isArray(item.transactions)
+      ? item.transactions
+      : item.transactions
+        ? [item.transactions]
+        : []
+    const paymentIsPaid = transactions.some((tx) => isPaidPaymentStatus(tx?.payment_status))
     return {
       id: item.id,
       clientId: item.client_id,
@@ -1998,7 +2033,9 @@ export async function fetchAttorneyConsultationRequests(userId) {
       area: item.title || 'Consultation',
       date: datetime.date,
       time: datetime.time,
-      payment: Number(item.amount || 0) > 0 ? 'Paid' : 'Unpaid',
+      payment: paymentIsPaid ? 'Paid' : 'Unpaid',
+      paymentStatus: paymentIsPaid ? 'paid' : 'unpaid',
+      scheduledAt: item.scheduled_at || null,
       status: status === 'APPROVED' ? 'Approved' : status === 'REJECTED' ? 'Rejected' : 'Pending',
       concern: item.notes || 'No additional notes provided.',
     }
@@ -2006,7 +2043,7 @@ export async function fetchAttorneyConsultationRequests(userId) {
 
   const notifications = (notificationsRes.data || []).map((item) => ({
     id: item.id,
-    text: `${item.title}: ${item.body}`,
+    text: `${item.title}: ${stripNotificationMarkers(item.body)}`,
     time: item.created_at ? new Date(item.created_at).toLocaleString() : 'Now',
     unread: !item.is_read,
   }))
@@ -2548,9 +2585,7 @@ export async function createAppointmentBooking({
   attachmentName,
   payload,
 }) {
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  const user = await getSessionUser()
 
   if (!user?.id) {
     throw new Error('Not authenticated')
@@ -3454,7 +3489,7 @@ export async function fetchAttorneyAnnouncementsData(userId) {
     return {
       id: item.id,
       title: item.title || 'Announcement',
-      body: item.body || '',
+      body: stripNotificationMarkers(item.body),
       imageUrl: parseNotificationImageUrl(item.data),
       date: valid ? dt.toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' }) : 'Today',
       time: valid ? dt.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' }) : 'Now',
@@ -3824,9 +3859,7 @@ export function prefetchAttorneyProfileStats(userId) {
  */
 export async function fetchConsultationTranscriptForAppointment(appointmentId, options = {}) {
   const includeMessages = options.includeMessages !== false
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  const user = await getSessionUser()
 
   if (!user) throw new Error('Not authenticated')
   if (!appointmentId) throw new Error('Appointment is required.')
@@ -3950,21 +3983,30 @@ export async function fetchConsultationTranscriptForAppointment(appointmentId, o
 // toggles a value in the Settings page.
 
 const APP_CONFIG_KNOWN_KEYS = ['prevent_double_booking', 'enforce_schedule_window']
-const APP_CONFIG_LOAD_TIMEOUT_MS = 8000
+const APP_CONFIG_LOAD_TIMEOUT_MS = 5000
+const APP_CONFIG_STORAGE_KEY = 'legallink.appConfigCache.v1'
 const appConfigCache = new Map()
 let appConfigLoadPromise = null
 let appConfigChannel = null
 
-const withAppConfigTimeout = (promise, label) =>
-  Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(
-        () => reject(new Error(`${label} timed out after ${APP_CONFIG_LOAD_TIMEOUT_MS}ms`)),
-        APP_CONFIG_LOAD_TIMEOUT_MS,
-      )
-    }),
-  ])
+const persistAppConfigCache = () => {
+  const snapshot = Object.fromEntries(appConfigCache)
+  AsyncStorage.setItem(APP_CONFIG_STORAGE_KEY, JSON.stringify(snapshot)).catch(() => {})
+}
+
+const restoreAppConfigCache = async () => {
+  try {
+    const raw = await AsyncStorage.getItem(APP_CONFIG_STORAGE_KEY)
+    const saved = raw ? JSON.parse(raw) : null
+    if (saved && typeof saved === 'object') {
+      Object.entries(saved).forEach(([key, value]) => {
+        if (!appConfigCache.has(key)) appConfigCache.set(key, value)
+      })
+    }
+  } catch {
+    // Corrupt or missing snapshot — the network fetch below fills the cache.
+  }
+}
 
 // Coerces typical Postgres jsonb representations (true/false, "true"/"false",
 // 1/0) into a strict boolean. Used by the admin toggles.
@@ -3985,22 +4027,32 @@ export const isAppConfigFlagOn = (key, fallback = true) => {
   return coerceFlag(appConfigCache.get(key), fallback)
 }
 
+// get_app_config is readable with the anon key, so call PostgREST directly instead of
+// supabase.rpc — the client would otherwise wait for auth session restore on cold start.
 const fetchAppConfigValue = async (key) => {
-  const { data, error } = await supabase.rpc('get_app_config', { p_key: key })
-  if (!error) return data ?? null
-
-  const isMissingFunction =
-    error?.code === '42883' ||
-    String(error?.message || '').toLowerCase().includes('does not exist')
-  if (!isMissingFunction) throw error
-
-  const { data: row, error: tableError } = await supabase
-    .from('app_config')
-    .select('value')
-    .eq('key', key)
-    .maybeSingle()
-  if (tableError) throw tableError
-  return row?.value ?? null
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), APP_CONFIG_LOAD_TIMEOUT_MS)
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_app_config`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ p_key: key }),
+      signal: controller.signal,
+    })
+    if (!res.ok) throw new Error(`app_config:${key} HTTP ${res.status}`)
+    return (await res.json()) ?? null
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`app_config:${key} timed out after ${APP_CONFIG_LOAD_TIMEOUT_MS}ms`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // Pre-fetches the known feature flags into the cache.
@@ -4008,19 +4060,17 @@ export function ensureAppConfigLoaded() {
   if (appConfigLoadPromise) return appConfigLoadPromise
 
   appConfigLoadPromise = (async () => {
+    await restoreAppConfigCache()
     await Promise.all(
       APP_CONFIG_KNOWN_KEYS.map(async (key) => {
         try {
-          const value = await withAppConfigTimeout(
-            fetchAppConfigValue(key),
-            `app_config:${key}`,
-          )
-          appConfigCache.set(key, value)
+          appConfigCache.set(key, await fetchAppConfigValue(key))
         } catch (err) {
           console.warn(`[app_config] failed to warm "${key}":`, err?.message || err)
         }
       }),
     )
+    persistAppConfigCache()
   })()
 
   appConfigLoadPromise.finally(() => {
@@ -4028,6 +4078,18 @@ export function ensureAppConfigLoaded() {
   })
 
   return appConfigLoadPromise
+}
+
+// Waits briefly for flags only when they are not cached yet; realtime keeps cached values current.
+export async function ensureAppConfigReady(maxWaitMs = 2000) {
+  const allCached = () => APP_CONFIG_KNOWN_KEYS.every((key) => appConfigCache.has(key))
+  if (allCached()) return
+  await restoreAppConfigCache()
+  if (allCached()) return
+  await Promise.race([
+    ensureAppConfigLoaded(),
+    new Promise((resolve) => setTimeout(resolve, maxWaitMs)),
+  ])
 }
 
 // Subscribes once to changes on public.app_config so the cache stays current.
@@ -4048,6 +4110,7 @@ export function subscribeToAppConfigChanges() {
           } else {
             appConfigCache.set(row.key, row.value ?? null)
           }
+          persistAppConfigCache()
         },
       )
       .subscribe()
@@ -4258,9 +4321,7 @@ export async function findAttorneyAvailabilitySlotId(attorneyId, scheduledAtIso)
 }
 
 export async function rescheduleClientAppointment({ appointmentId, scheduledAt, note }) {
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  const user = await getSessionUser()
   if (!user?.id) throw new Error('Not authenticated.')
 
   const { data: appt, error: fetchErr } = await supabase

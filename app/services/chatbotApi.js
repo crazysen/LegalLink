@@ -1,4 +1,4 @@
-import {supabase} from './supabaseClient';
+import {supabase, getSessionUser} from './supabaseClient';
 
 const FUNCTION_NAME =
   process.env.EXPO_PUBLIC_AI_ASSISTANT_FUNCTION ||
@@ -324,8 +324,8 @@ const resolveUserId = async profile => {
   if (candidate) return candidate;
 
   try {
-    const {data} = await supabase.auth.getUser();
-    return normalizeText(data?.user?.id);
+    const user = await getSessionUser();
+    return normalizeText(user?.id);
   } catch {
     return '';
   }

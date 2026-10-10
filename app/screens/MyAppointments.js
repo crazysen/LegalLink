@@ -24,7 +24,7 @@ import {
   parseAppointmentScheduleMs,
 } from '../services/appointmentService';
 import {
-  ensureAppConfigLoaded,
+  ensureAppConfigReady,
   fetchClientConsultationQueue,
   parseReschedulePendingFromNotes,
   rescheduleClientAppointment,
@@ -324,7 +324,7 @@ export default function MyAppointments({ navigation }) {
     const force = Boolean(options?.force);
     try {
       if (!force) setLoading(true);
-      await ensureAppConfigLoaded();
+      await ensureAppConfigReady();
 
       let userId = clientId;
       if (!userId) {

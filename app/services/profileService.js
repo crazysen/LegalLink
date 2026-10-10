@@ -1,8 +1,8 @@
-import { supabase } from './supabaseClient';
+import { supabase, getSessionUser } from './supabaseClient';
 import { e164ToPhilippinesLocal11 } from './authService';
 
 export async function getMyProfile() {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const { data, error } = await supabase
@@ -29,7 +29,7 @@ export async function getMyProfile() {
 }
 
 export async function updateMyProfile(payload) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   let avatarUrl = payload.avatar_url;

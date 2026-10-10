@@ -18,6 +18,9 @@ const supabaseAnonKey = (
   FALLBACK_SUPABASE_ANON_KEY
 ).trim();
 
+export const SUPABASE_URL = supabaseUrl;
+export const SUPABASE_ANON_KEY = supabaseAnonKey;
+
 /** False only if URL/key resolve empty (should not happen with fallbacks). */
 export function isSupabaseConfigured() {
   return Boolean(supabaseUrl && supabaseAnonKey);
@@ -64,6 +67,18 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     detectSessionInUrl: false,
   },
 });
+
+/**
+ * Signed-in user from the stored session. Avoids the Auth server round trip of
+ * `auth.getUser()`; RLS still validates the JWT on every data request.
+ * Use `auth.getUser()` only where fresh verification state is required.
+ */
+export async function getSessionUser() {
+  const {
+    data: {session},
+  } = await supabase.auth.getSession();
+  return session?.user ?? null;
+}
 
 /**
  * True when stored session cannot be refreshed (wrong project, revoked session, or corrupt storage).

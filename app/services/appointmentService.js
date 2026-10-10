@@ -1,9 +1,10 @@
-import { supabase } from './supabaseClient';
+import { supabase, getSessionUser } from './supabaseClient';
 import {
   createAppointmentBooking,
   fetchAvailability as fetchAvailabilityFromUserApi,
   isConsultationChatWindowOpen,
   buildChatScheduleBlockedMessage,
+  ensureAppConfigReady,
 } from './userApi';
 import { sortAvailabilitySlotsChronologically } from './availabilityScheduleUtils';
 
@@ -333,16 +334,19 @@ export async function getMyAppointments(options = {}) {
     return [];
   }
 
-  const { data, error } = await supabase
-    .from('appointments')
-    .select(`
-      *,
-      client:client_id (full_name),
-      attorney:attorney_id (full_name),
-      transactions (payment_status)
-    `)
-    .or(`client_id.eq.${user.id},attorney_id.eq.${user.id}`)
-    .order('created_at', { ascending: false });
+  const [{ data, error }] = await Promise.all([
+    supabase
+      .from('appointments')
+      .select(`
+        *,
+        client:client_id (full_name),
+        attorney:attorney_id (full_name),
+        transactions (payment_status)
+      `)
+      .or(`client_id.eq.${user.id},attorney_id.eq.${user.id}`)
+      .order('created_at', { ascending: false }),
+    ensureAppConfigReady(),
+  ]);
 
   if (error) {
     throw new Error(error.message);
@@ -393,6 +397,7 @@ export async function getMyAppointments(options = {}) {
       scheduledAt: item?.scheduled_at,
       slotDate: item?.slot_date,
       slotTime: item?.slot_time,
+      paymentStatus: item?.payment_is_paid,
     })
     const chatAccessible = statusLower === 'completed' ? true : chatWindowOpen
     const chatBlockedMessage = chatAccessible
@@ -422,9 +427,7 @@ export async function getMyAppointments(options = {}) {
  * Paid consultation booking — uses the same Supabase path as the web app (`createAppointmentBooking`).
  */
 export async function createAppointment(payload) {
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) {
     throw new Error('Not authenticated');
   }
@@ -976,7 +979,7 @@ export async function getAttorneyCompletedConsultationSlotKeys(attorneyId) {
 }
 
 export async function setAvailability(date, slots) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const now = new Date();
@@ -1043,7 +1046,7 @@ export async function setAvailability(date, slots) {
 }
 
 export async function setWeeklyAvailability(startDate, endDate, slots) {
-  const { data: { user } } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) throw new Error('Not authenticated');
 
   const now = new Date();

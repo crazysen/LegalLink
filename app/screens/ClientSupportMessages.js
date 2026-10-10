@@ -24,8 +24,7 @@ import {
 } from '../services/userApi';
 
 const NAVY = '#152238';
-const CREAM = '#faf8f4';
-const CREAM_BORDER = '#ece6de';
+const GOLD_BORDER = 'rgba(244, 215, 139, 0.15)';
 
 function formatTimeLabel(value) {
   if (!value) return '';
@@ -191,8 +190,6 @@ export default function ClientSupportMessages({navigation, route}) {
               style={styles.backHit}
               onPress={() => (navigation.canGoBack() ? navigation.goBack() : navigation.navigate('HomepageClient'))}
             />
-            <Text style={styles.screenTitle}>Messages</Text>
-            <Text style={styles.screenSubtitle}>Message LegalLink Admin for help or follow-ups.</Text>
           </View>
 
           <View style={styles.card}>
@@ -243,7 +240,7 @@ export default function ClientSupportMessages({navigation, route}) {
                 value={draft}
                 onChangeText={setDraft}
                 placeholder="Type your message to LegalLink Admin..."
-                placeholderTextColor="rgba(21, 34, 56, 0.45)"
+                placeholderTextColor={T.textSoft}
                 editable={!sending && Boolean(clientId)}
                 maxLength={2000}
                 multiline
@@ -272,19 +269,7 @@ const styles = StyleSheet.create({
     paddingBottom: 12,
   },
   backHit: {
-    marginBottom: 8,
     alignSelf: 'flex-start',
-  },
-  screenTitle: {
-    color: T.text,
-    fontSize: 22,
-    fontWeight: '800',
-  },
-  screenSubtitle: {
-    color: T.textSoft,
-    fontSize: 13,
-    marginTop: 4,
-    lineHeight: 18,
   },
   card: {
     flex: 1,
@@ -292,8 +277,8 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: 'rgba(214, 193, 160, 0.32)',
-    backgroundColor: '#fff',
+    borderColor: 'rgba(244, 215, 139, 0.12)',
+    backgroundColor: 'rgba(18, 26, 36, 0.85)',
     overflow: 'hidden',
   },
   chatHead: {
@@ -342,7 +327,7 @@ const styles = StyleSheet.create({
   },
   thread: {
     flex: 1,
-    backgroundColor: CREAM,
+    backgroundColor: 'transparent',
     paddingHorizontal: 14,
     paddingVertical: 12,
   },
@@ -352,13 +337,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   emptyTitle: {
-    color: NAVY,
+    color: T.text,
     fontSize: 16,
     fontWeight: '700',
     marginBottom: 6,
   },
   emptyBody: {
-    color: '#6b7280',
+    color: T.textSoft,
     fontSize: 14,
     textAlign: 'center',
     lineHeight: 20,
@@ -380,12 +365,14 @@ const styles = StyleSheet.create({
   },
   bubbleMine: {
     backgroundColor: NAVY,
+    borderWidth: 1,
+    borderColor: 'rgba(244, 215, 139, 0.35)',
     borderBottomRightRadius: 4,
   },
   bubbleTheirs: {
-    backgroundColor: '#fff',
+    backgroundColor: 'rgba(255,255,255,0.08)',
     borderWidth: 1,
-    borderColor: CREAM_BORDER,
+    borderColor: GOLD_BORDER,
     borderBottomLeftRadius: 4,
   },
   bubbleText: {
@@ -393,7 +380,7 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
   bubbleTextMine: {color: '#fff'},
-  bubbleTextTheirs: {color: '#0b0f19'},
+  bubbleTextTheirs: {color: T.text},
   bubbleMeta: {
     fontSize: 10,
     marginTop: 4,
@@ -403,7 +390,7 @@ const styles = StyleSheet.create({
     textAlign: 'right',
   },
   bubbleMetaTheirs: {
-    color: 'rgba(11, 15, 25, 0.55)',
+    color: T.textSoft,
     textAlign: 'right',
   },
   composer: {
@@ -412,24 +399,24 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingTop: 12,
     borderTopWidth: 1,
-    borderTopColor: CREAM_BORDER,
-    backgroundColor: '#fff',
+    borderTopColor: GOLD_BORDER,
+    backgroundColor: 'rgba(4, 7, 11, 0.35)',
   },
   input: {
     flex: 1,
     minHeight: 44,
     maxHeight: 120,
     borderWidth: 1,
-    borderColor: '#d6c1a0',
+    borderColor: GOLD_BORDER,
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 10,
     fontSize: 15,
-    color: NAVY,
-    backgroundColor: CREAM,
+    color: T.text,
+    backgroundColor: 'rgba(4, 7, 11, 0.5)',
   },
   sendBtn: {
-    backgroundColor: NAVY,
+    backgroundColor: T.gold[1],
     borderRadius: 12,
     paddingHorizontal: 20,
     paddingVertical: 12,
@@ -440,7 +427,7 @@ const styles = StyleSheet.create({
     opacity: 0.5,
   },
   sendBtnLabel: {
-    color: '#fff',
+    color: T.base,
     fontWeight: '700',
     fontSize: 14,
   },

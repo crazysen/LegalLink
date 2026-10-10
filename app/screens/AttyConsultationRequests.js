@@ -152,6 +152,7 @@ export default function AttyConsultationRequests({navigation}) {
             const canEnter = isConsultationChatWindowOpen({
               status: statusKey === 'approved' ? 'confirmed' : statusKey,
               scheduledAt: item.scheduledAt || `${item.date} ${item.time}`,
+              paymentStatus: item.paymentStatus,
             });
 
             return (
