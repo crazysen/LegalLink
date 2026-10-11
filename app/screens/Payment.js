@@ -472,13 +472,9 @@ export default function Payment({navigation, route}) {
       setIsPaying(true);
       setPaymentStatus('pending');
 
-      const sessionStartedAt = Date.now();
       // Notarial: fresh session per attempt so a retry never reuses a cancelled checkout.
       const session =
         (!isNotarialPay && checkoutSession) || (await buildPaymongoSession());
-      if (__DEV__) {
-        console.log(`[pay-timing] PayMongo checkout ready in ${Date.now() - sessionStartedAt}ms`);
-      }
       if (!session?.checkoutUrl) {
         throw new Error('Checkout URL is missing. Please try again.');
       }

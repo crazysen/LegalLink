@@ -109,7 +109,6 @@ const NewRequestForm = ({navigation}) => {
     try {
       setSubmitting(true);
       warmPaymentBackend().catch(() => {});
-      const startedAt = Date.now();
 
       let documentBytes = null;
       let documentBase64 = null;
@@ -120,7 +119,6 @@ const NewRequestForm = ({navigation}) => {
           encoding: FileSystem.EncodingType.Base64,
         });
       }
-      const readMs = Date.now() - startedAt;
 
       const created = await createNotarialRequest({
         service_type: serviceType.trim(),
@@ -130,11 +128,6 @@ const NewRequestForm = ({navigation}) => {
         document_base64: documentBase64,
         amount: NOTARIAL_SERVICE_FEE,
       });
-      if (__DEV__) {
-        console.log(
-          `[pay-timing] file read ${readMs}ms, upload+save ${Date.now() - startedAt - readMs}ms`,
-        );
-      }
 
       if (!created?.id) {
         throw new Error('Could not save your request. Please try again.');
