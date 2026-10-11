@@ -5,6 +5,8 @@ const OTHER_ROLE = {
   attorney: 'client',
 };
 
+const ROOM_RELEASE_DELAY_MS = 3000;
+
 /** @type {Set<string>} */
 const dismissedPeerEntryKeys = new Set();
 
@@ -20,27 +22,46 @@ export function isConsultationPeerEntryDismissed(appointmentId, otherJoinedAt) {
   return dismissedPeerEntryKeys.has(peerEntryKey(appointmentId, otherJoinedAt));
 }
 
-function clearDismissalsForAppointment(appointmentId) {
-  const prefix = `${String(appointmentId)}:`;
-  for (const key of dismissedPeerEntryKeys) {
-    if (key.startsWith(prefix)) {
-      dismissedPeerEntryKeys.delete(key);
-    }
-  }
+/**
+ * Peer call sessions this user already rang for, joined, declined, or saw while in the chat.
+ * Shared app-wide so leaving the chat/call never re-rings the same call.
+ */
+const seenCallKeys = new Set();
+
+function callKey(appointmentId, callStartedAt) {
+  return `${String(appointmentId)}:${String(callStartedAt)}`;
 }
 
-export function buildConsultationWaitingCopy({ otherRole, otherPartyName }) {
+export function markConsultationCallSeen(appointmentId, callStartedAt) {
+  if (appointmentId && callStartedAt) seenCallKeys.add(callKey(appointmentId, callStartedAt));
+}
+
+export function isConsultationCallSeen(appointmentId, callStartedAt) {
+  return seenCallKeys.has(callKey(appointmentId, callStartedAt));
+}
+
+function peerLabel(otherRole, otherPartyName) {
   const label = otherRole === 'attorney' ? 'Attorney' : 'Client';
-  const name = String(otherPartyName || '').trim() || label;
-  if (otherRole === 'attorney') {
-    return {
-      title: `${name} is in the consultation chatroom`,
-      body: 'Your attorney entered the consultation chatroom first and is waiting for you to join.',
-    };
-  }
+  return String(otherPartyName || '').trim() || label;
+}
+
+/** Other party was already in the chatroom when this user arrived. */
+export function buildConsultationWaitingCopy({ otherRole, otherPartyName }) {
+  const name = peerLabel(otherRole, otherPartyName);
   return {
     title: `${name} is in the consultation chatroom`,
-    body: 'Your client entered the consultation chatroom first and is waiting for you to join.',
+    body:
+      otherRole === 'attorney'
+        ? 'Your attorney is already in the consultation chatroom and is waiting for you.'
+        : 'Your client is already in the consultation chatroom and is waiting for you.',
+  };
+}
+
+export function buildConsultationIncomingCallCopy({ otherRole, otherPartyName }) {
+  const name = peerLabel(otherRole, otherPartyName);
+  return {
+    title: `${name} is calling you`,
+    body: 'Video call for your consultation. Tap Join to connect.',
   };
 }
 
@@ -57,192 +78,211 @@ function listChannelPresences(channel) {
   return all;
 }
 
-function findOtherInChat(presences, otherRole) {
-  return presences.find(
-    entry => entry?.role === otherRole && entry?.inChat === true,
-  );
+function earliestStamp(entries, field) {
+  const stamps = entries
+    .map(entry => entry?.[field])
+    .filter(Boolean)
+    .sort();
+  return stamps[0] || null;
+}
+
+// Web chat entries carry `inChat` but no call state; current mobile entries always send a
+// boolean `inCall`, so `reportsCallState` tells callers whether presence can be trusted for calls.
+function summarizePeer(channel, otherRole) {
+  const entries = listChannelPresences(channel).filter(entry => entry?.role === otherRole);
+  const inChatEntries = entries.filter(entry => entry?.inChat !== false && !entry?.watching);
+  const callEntries = entries.filter(entry => entry?.inCall === true);
+  return {
+    present: inChatEntries.length > 0 || callEntries.length > 0,
+    inChat: inChatEntries.length > 0,
+    joinedAt: earliestStamp(inChatEntries, 'joinedAt'),
+    inCall: callEntries.length > 0,
+    callStartedAt: earliestStamp(callEntries, 'callStartedAt'),
+    reportsCallState: entries.some(entry => typeof entry?.inCall === 'boolean'),
+  };
 }
 
 /**
- * User is inside the consultation chat screen for this appointment.
+ * One realtime channel per consultation. Supabase returns the same channel object for a
+ * repeated topic, so chat screens and the app-wide watcher must share it (ref-counted).
  */
-export function attachConsultationChatPresence({
+const rooms = new Map();
+
+function trackSelf(room) {
+  if (!room.subscribed) return;
+  room.channel.track({ ...room.self }).catch(error => {
+    console.warn('[chat-presence] track failed', error?.message || error);
+  });
+}
+
+function emitPeer(room) {
+  if (!room.synced) return;
+  const peer = summarizePeer(room.channel, room.otherRole);
+  room.listeners.forEach(listener => {
+    const prev = listener.prevPeer;
+    listener.prevPeer = peer;
+    listener.onPeerChange?.(peer, prev);
+  });
+  if (peer.inCall && room.self.inCall) {
+    markConsultationCallSeen(room.id, peer.callStartedAt);
+  }
+}
+
+function createRoom(appointmentId, role, userId, displayName) {
+  const normalizedRole = normalizeRole(role);
+  const room = {
+    id: appointmentId,
+    otherRole: OTHER_ROLE[normalizedRole],
+    self: {
+      role: normalizedRole,
+      userId: String(userId),
+      displayName:
+        String(displayName || '').trim() ||
+        (normalizedRole === 'attorney' ? 'Attorney' : 'Client'),
+      inChat: false,
+      watching: true,
+      joinedAt: null,
+      inCall: false,
+      callStartedAt: null,
+    },
+    chatRefs: 0,
+    listeners: new Set(),
+    subscribed: false,
+    synced: false,
+    releaseTimer: null,
+    channel: null,
+  };
+
+  room.channel = supabase.channel(`consultation-presence:${appointmentId}`, {
+    config: { presence: { key: `${normalizedRole}:${userId}` } },
+  });
+
+  room.channel
+    .on('presence', { event: 'sync' }, () => {
+      room.synced = true;
+      emitPeer(room);
+    })
+    .on('presence', { event: 'join' }, () => emitPeer(room))
+    .on('presence', { event: 'leave' }, () => emitPeer(room))
+    .on('broadcast', { event: 'call-declined' }, ({ payload }) => {
+      if (payload?.toRole !== room.self.role) return;
+      room.listeners.forEach(listener => listener.onCallDeclined?.(payload));
+    })
+    .subscribe(status => {
+      if (status !== 'SUBSCRIBED') {
+        room.subscribed = false;
+        return;
+      }
+      room.subscribed = true;
+      trackSelf(room);
+    });
+
+  return room;
+}
+
+function destroyRoom(room) {
+  rooms.delete(room.id);
+  room.subscribed = false;
+  room.channel.untrack().catch(() => {});
+  supabase.removeChannel(room.channel);
+}
+
+function setChatRefs(room, delta) {
+  const wasInChat = room.chatRefs > 0;
+  room.chatRefs = Math.max(0, room.chatRefs + delta);
+  const inChat = room.chatRefs > 0;
+  if (inChat === wasInChat) return;
+  room.self.inChat = inChat;
+  room.self.watching = !inChat;
+  room.self.joinedAt = inChat ? new Date().toISOString() : null;
+  if (!inChat) {
+    room.self.inCall = false;
+    room.self.callStartedAt = null;
+  }
+  trackSelf(room);
+}
+
+/**
+ * Joins the shared presence room for one consultation.
+ * `inChat: true` marks this user as inside the chatroom (chat screens); watchers pass false.
+ * `onPeerChange(peer, prevPeer)` fires on every presence change; prevPeer is null on the first call.
+ */
+export function joinConsultationRoom({
   appointmentId,
   role,
   userId,
   displayName,
-  otherPartyName,
-  onWaitingPopup,
+  inChat = false,
+  onPeerChange,
+  onCallDeclined,
 }) {
   if (!appointmentId || !userId) {
-    return () => {};
+    return {
+      setInCall: () => {},
+      sendCallDeclined: () => {},
+      release: () => {},
+    };
   }
 
-  const normalizedRole = normalizeRole(role);
-  const otherRole = OTHER_ROLE[normalizedRole];
-  let selfTracked = false;
-  let hasShownWaitingPopup = false;
-  let lastOtherJoinedAt = null;
-
-  const channel = supabase.channel(`consultation-presence:${appointmentId}`, {
-    config: { presence: { key: `${normalizedRole}:${userId}` } },
-  });
-
-  const notifyIfOtherAlreadyWaiting = () => {
-    if (!selfTracked || hasShownWaitingPopup) {
-      return;
-    }
-    const other = findOtherInChat(listChannelPresences(channel), otherRole);
-    if (!other) {
-      return;
-    }
-    const joinedAt = other.joinedAt || other.userId || 'unknown';
-    if (isConsultationPeerEntryDismissed(appointmentId, joinedAt)) {
-      hasShownWaitingPopup = true;
-      return;
-    }
-    hasShownWaitingPopup = true;
-    lastOtherJoinedAt = joinedAt;
-    if (typeof onWaitingPopup === 'function') {
-      onWaitingPopup({
-        ...buildConsultationWaitingCopy({ otherRole, otherPartyName }),
-        appointmentId: String(appointmentId),
-        otherJoinedAt: joinedAt,
-      });
-    }
-  };
-
-  const handlePresenceChange = () => {
-    const other = findOtherInChat(listChannelPresences(channel), otherRole);
-    if (!other) {
-      if (lastOtherJoinedAt) {
-        clearDismissalsForAppointment(appointmentId);
-      }
-      lastOtherJoinedAt = null;
-      return;
-    }
-    notifyIfOtherAlreadyWaiting();
-  };
-
-  channel
-    .on('presence', { event: 'sync' }, handlePresenceChange)
-    .on('presence', { event: 'join' }, handlePresenceChange)
-    .on('presence', { event: 'leave' }, handlePresenceChange)
-    .subscribe(async status => {
-      if (status !== 'SUBSCRIBED') {
-        return;
-      }
-      try {
-        await channel.track({
-          role: normalizedRole,
-          userId: String(userId),
-          displayName:
-            String(displayName || '').trim() ||
-            (normalizedRole === 'attorney' ? 'Attorney' : 'Client'),
-          inChat: true,
-          joinedAt: new Date().toISOString(),
-        });
-        selfTracked = true;
-        notifyIfOtherAlreadyWaiting();
-      } catch (error) {
-        console.warn('[chat-presence] track failed', error?.message || error);
-      }
-    });
-
-  return () => {
-    selfTracked = false;
-    channel.untrack().catch(() => {});
-    supabase.removeChannel(channel);
-  };
-}
-
-/**
- * Listen for the other party entering the chat while the current user is elsewhere.
- */
-export function subscribeConsultationPeerEntry({
-  appointmentId,
-  role,
-  userId,
-  otherPartyName,
-  isViewingChat,
-  onPeerEntered,
-}) {
-  if (!appointmentId || !userId) {
-    return () => {};
+  const id = String(appointmentId);
+  let room = rooms.get(id);
+  if (room && room.self.userId !== String(userId)) {
+    destroyRoom(room);
+    room = null;
+  }
+  if (!room) {
+    room = createRoom(id, role, userId, displayName);
+    rooms.set(id, room);
+  }
+  if (room.releaseTimer) {
+    clearTimeout(room.releaseTimer);
+    room.releaseTimer = null;
   }
 
-  const normalizedRole = normalizeRole(role);
-  const otherRole = OTHER_ROLE[normalizedRole];
-  let cancelled = false;
-  let lastNotifiedJoinKey = null;
+  const listener = { onPeerChange, onCallDeclined, prevPeer: null };
+  room.listeners.add(listener);
+  if (inChat) setChatRefs(room, 1);
+  if (room.synced) emitPeer(room);
 
-  const channel = supabase.channel(`consultation-presence:${appointmentId}`, {
-    config: { presence: { key: `watcher:${normalizedRole}:${userId}` } },
-  });
+  const activeRoom = room;
+  let released = false;
 
-  const evaluate = () => {
-    if (cancelled) {
-      return;
-    }
-    if (typeof isViewingChat === 'function' && isViewingChat()) {
-      return;
-    }
-
-    const other = findOtherInChat(listChannelPresences(channel), otherRole);
-    if (!other) {
-      if (lastNotifiedJoinKey) {
-        clearDismissalsForAppointment(appointmentId);
-      }
-      lastNotifiedJoinKey = null;
-      return;
-    }
-
-    const joinedAt = other.joinedAt || other.userId || 'unknown';
-    const notifyKey = peerEntryKey(appointmentId, joinedAt);
-    if (notifyKey === lastNotifiedJoinKey) {
-      return;
-    }
-    if (isConsultationPeerEntryDismissed(appointmentId, joinedAt)) {
-      lastNotifiedJoinKey = notifyKey;
-      return;
-    }
-
-    lastNotifiedJoinKey = notifyKey;
-    if (typeof onPeerEntered === 'function') {
-      onPeerEntered({
-        ...buildConsultationWaitingCopy({ otherRole, otherPartyName }),
-        appointmentId: String(appointmentId),
-        otherJoinedAt: joinedAt,
-        otherPartyName,
-      });
-    }
-  };
-
-  channel
-    .on('presence', { event: 'sync' }, evaluate)
-    .on('presence', { event: 'join' }, evaluate)
-    .on('presence', { event: 'leave' }, evaluate)
-    .subscribe(async status => {
-      if (status !== 'SUBSCRIBED' || cancelled) {
-        return;
-      }
-      try {
-        await channel.track({
-          role: normalizedRole,
-          userId: String(userId),
-          inChat: false,
-          watching: true,
-        });
-      } catch {
-        /* watcher may still receive presence events */
-      }
-      evaluate();
-    });
-
-  return () => {
-    cancelled = true;
-    channel.untrack().catch(() => {});
-    supabase.removeChannel(channel);
+  return {
+    setInCall: inCall => {
+      if (released) return;
+      const next = Boolean(inCall);
+      if (activeRoom.self.inCall === next) return;
+      activeRoom.self.inCall = next;
+      activeRoom.self.callStartedAt = next ? new Date().toISOString() : null;
+      trackSelf(activeRoom);
+    },
+    sendCallDeclined: () => {
+      if (released || !activeRoom.subscribed) return;
+      activeRoom.channel
+        .send({
+          type: 'broadcast',
+          event: 'call-declined',
+          payload: {
+            fromRole: activeRoom.self.role,
+            toRole: activeRoom.otherRole,
+            name: activeRoom.self.displayName,
+          },
+        })
+        .catch(() => {});
+    },
+    release: () => {
+      if (released) return;
+      released = true;
+      activeRoom.listeners.delete(listener);
+      if (inChat) setChatRefs(activeRoom, -1);
+      if (activeRoom.listeners.size > 0 || activeRoom.releaseTimer) return;
+      activeRoom.releaseTimer = setTimeout(() => {
+        activeRoom.releaseTimer = null;
+        if (activeRoom.listeners.size === 0 && rooms.get(activeRoom.id) === activeRoom) {
+          destroyRoom(activeRoom);
+        }
+      }, ROOM_RELEASE_DELAY_MS);
+    },
   };
 }
 
@@ -259,4 +299,9 @@ export function getConsultationChatFocusedAppointmentId(navigationRef) {
     return id ? String(id) : null;
   }
   return null;
+}
+
+export function isOnVideoCallScreen(navigationRef) {
+  if (!navigationRef?.isReady?.()) return false;
+  return navigationRef.getCurrentRoute?.()?.name === 'ConsultationVideoCall';
 }

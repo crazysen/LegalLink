@@ -37,10 +37,7 @@ import {
   saveAttorneyConsultationBranch,
   saveAttorneyConsultationSummary,
 } from '../services/messageService';
-import {
-  attachConsultationChatPresence,
-  dismissConsultationPeerEntry,
-} from '../services/consultationChatPresence';
+import useConsultationCallAlerts from '../hooks/useConsultationCallAlerts';
 import ConsultationWaitingPopup from '../components/ConsultationWaitingPopup';
 import {getAppointmentConsultationMeta} from '../services/appointmentService';
 import {
@@ -104,7 +101,6 @@ export default function ConsultationChat({navigation, route}) {
   const [keyboardInset, setKeyboardInset] = useState(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [sessionBounds, setSessionBounds] = useState(null);
-  const [waitingPopup, setWaitingPopup] = useState(null);
   const [localParticipantName, setLocalParticipantName] = useState('Attorney');
   const [summaryModalVisible, setSummaryModalVisible] = useState(false);
   const [branchPickerVisible, setBranchPickerVisible] = useState(false);
@@ -120,14 +116,28 @@ export default function ConsultationChat({navigation, route}) {
   const notifIdsRef = useRef([]);
   const prevTimerPhaseRef = useRef(null);
   const isFocusedRef = useRef(false);
-  const startedMeetingIdRef = useRef(null);
-  const autoOpenedMeetingIdRef = useRef(null);
+  const joinCallParamHandledRef = useRef(false);
   const clientName = route?.params?.clientName || 'Sarah Jenkins';
   const clientInitials = route?.params?.clientInitials || 'SJ';
   const threadId = useMemo(
     () => String(route?.params?.chatId || route?.params?.clientName || 'general-chat'),
     [route?.params?.chatId, route?.params?.clientName],
   );
+  const {
+    incomingCall,
+    acceptIncomingCall,
+    declineIncomingCall,
+    markSelfInCall,
+    observeMeetingId,
+    isPeerCallActive,
+  } = useConsultationCallAlerts({
+    appointmentId: threadId,
+    role: 'attorney',
+    otherPartyName: clientName,
+    isFocused,
+    chatOpen: !isClosed,
+    joiningCall: Boolean(route?.params?.joinCall),
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -204,16 +214,13 @@ export default function ConsultationChat({navigation, route}) {
       const {messages: rows, isClosed: closed, videoMeetingId} = await getThreadMessages(threadId);
       setMessages(rows);
       setIsClosed(closed);
-      setIncomingMeetingId(prev => {
-        const next = videoMeetingId || null;
-        if (next && next === startedMeetingIdRef.current) return prev;
-        return next;
-      });
+      setIncomingMeetingId(videoMeetingId || null);
+      observeMeetingId(videoMeetingId);
     } catch {
       setMessages([]);
       setIsClosed(false);
     }
-  }, [threadId]);
+  }, [threadId, observeMeetingId]);
 
   useEffect(() => {
     loadThread();
@@ -282,30 +289,6 @@ export default function ConsultationChat({navigation, route}) {
   }, []);
 
   useEffect(() => {
-    if (!threadId || threadId === 'general-chat') return undefined;
-    let cancelled = false;
-    let detachPresence = () => {};
-
-    (async () => {
-      const {profile} = await getCurrentSessionProfile();
-      if (cancelled || !profile?.id) return;
-      detachPresence = attachConsultationChatPresence({
-        appointmentId: threadId,
-        role: 'attorney',
-        userId: profile.id,
-        displayName: profile.full_name || 'Attorney',
-        otherPartyName: clientName,
-        onWaitingPopup: copy => setWaitingPopup(copy),
-      });
-    })();
-
-    return () => {
-      cancelled = true;
-      detachPresence();
-    };
-  }, [threadId, clientName]);
-
-  useEffect(() => {
     if (!sessionBounds || isClosed) {
       tenMinuteWarningSentRef.current = false;
       return;
@@ -344,11 +327,8 @@ export default function ConsultationChat({navigation, route}) {
           setIsClosed,
           {
             onVideoMeetingChange: meetingId => {
-              setIncomingMeetingId(prev => {
-                const next = meetingId || null;
-                if (next && next === startedMeetingIdRef.current) return prev;
-                return next;
-              });
+              setIncomingMeetingId(meetingId || null);
+              observeMeetingId(meetingId, {fromRealtime: true});
             },
           },
         );
@@ -363,7 +343,7 @@ export default function ConsultationChat({navigation, route}) {
       cancelled = true;
       unsubscribe();
     };
-  }, [threadId]);
+  }, [threadId, observeMeetingId]);
 
   useFocusEffect(
     useCallback(() => {
@@ -404,9 +384,7 @@ export default function ConsultationChat({navigation, route}) {
     try {
       setVideoBusy(true);
       const {meetingId, roomId, token} = await getOrCreateVideoMeeting(threadId);
-      startedMeetingIdRef.current = meetingId;
-      autoOpenedMeetingIdRef.current = meetingId;
-      setIncomingMeetingId(null);
+      markSelfInCall({startedMeetingId: meetingId});
       navigation.navigate('ConsultationVideoCall', {
         meetingId,
         token,
@@ -423,17 +401,17 @@ export default function ConsultationChat({navigation, route}) {
 
   const joinIncomingVideoCall = useCallback(
     async meetingId => {
-      if (!threadId || !meetingId || isClosed) return;
-      if (videoBusy) return;
+      if (!threadId || isClosed || videoBusy) return;
+      acceptIncomingCall();
       try {
         setVideoBusy(true);
-        const {roomId} = await getOrCreateVideoMeeting(threadId);
+        const meeting = await getOrCreateVideoMeeting(threadId);
         const token = await getVideoSdkToken();
-        autoOpenedMeetingIdRef.current = meetingId;
+        markSelfInCall();
         navigation.navigate('ConsultationVideoCall', {
-          meetingId,
+          meetingId: meetingId || meeting.meetingId,
           token,
-          consultationRoomId: roomId,
+          consultationRoomId: meeting.roomId,
           participantName: localParticipantName,
           remoteParticipantName: clientName || 'Client',
         });
@@ -443,22 +421,28 @@ export default function ConsultationChat({navigation, route}) {
         setVideoBusy(false);
       }
     },
-    [clientName, isClosed, localParticipantName, navigation, threadId, videoBusy],
+    [
+      acceptIncomingCall,
+      clientName,
+      isClosed,
+      localParticipantName,
+      markSelfInCall,
+      navigation,
+      threadId,
+      videoBusy,
+    ],
   );
 
   const handleDismissIncomingCall = () => {
-    const meetingId = incomingMeetingId;
     setIncomingMeetingId(null);
-    autoOpenedMeetingIdRef.current = meetingId;
   };
 
-  // Web parity: auto-open the call once when the client starts it; the banner stays as the fallback/rejoin.
+  // Joining from the app-wide incoming call popup (user tapped Join on another screen).
   useEffect(() => {
-    if (!isFocused || isClosed || !incomingMeetingId) return;
-    if (autoOpenedMeetingIdRef.current === incomingMeetingId) return;
-    autoOpenedMeetingIdRef.current = incomingMeetingId;
-    joinIncomingVideoCall(incomingMeetingId);
-  }, [isFocused, isClosed, incomingMeetingId, joinIncomingVideoCall]);
+    if (!route?.params?.joinCall || joinCallParamHandledRef.current || isClosed) return;
+    joinCallParamHandledRef.current = true;
+    joinIncomingVideoCall(null).finally(() => navigation.setParams({joinCall: undefined}));
+  }, [route?.params?.joinCall, isClosed, navigation, joinIncomingVideoCall]);
 
   useEffect(() => {
     if (isClosed) return;
@@ -703,7 +687,7 @@ export default function ConsultationChat({navigation, route}) {
                   nowMs={nowMs}
                   isClosed={isClosed}
                 />
-                {!isClosed && incomingMeetingId ? (
+                {!isClosed && incomingMeetingId && isPeerCallActive(incomingMeetingId) ? (
                   <View style={styles.incomingCallCard}>
                     <View style={styles.incomingCallTextWrap}>
                       <Text style={styles.incomingCallTitle}>Active video call</Text>
@@ -890,21 +874,14 @@ export default function ConsultationChat({navigation, route}) {
         </View>
       </Modal>
       <ConsultationWaitingPopup
-        visible={Boolean(waitingPopup)}
-        title={waitingPopup?.title}
-        body={waitingPopup?.body}
+        visible={Boolean(incomingCall)}
+        title={incomingCall?.title}
+        body={incomingCall?.body}
         showGoToChatroom
-        goToChatroomLabel="Continue in Chatroom"
-        onNotNow={() => {
-          if (waitingPopup?.appointmentId) {
-            dismissConsultationPeerEntry(
-              waitingPopup.appointmentId,
-              waitingPopup.otherJoinedAt,
-            );
-          }
-          setWaitingPopup(null);
-        }}
-        onGoToChatroom={() => setWaitingPopup(null)}
+        goToChatroomLabel="Join"
+        notNowLabel="Decline"
+        onNotNow={declineIncomingCall}
+        onGoToChatroom={() => joinIncomingVideoCall(incomingMeetingId)}
       />
     </ClientScreenShell>
   );

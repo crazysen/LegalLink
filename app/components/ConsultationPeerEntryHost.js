@@ -2,10 +2,17 @@ import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {AppState} from 'react-native';
 import {getMyAppointments} from '../services/appointmentService';
 import {
+  buildConsultationIncomingCallCopy,
+  buildConsultationWaitingCopy,
   dismissConsultationPeerEntry,
   getConsultationChatFocusedAppointmentId,
-  subscribeConsultationPeerEntry,
+  isConsultationCallSeen,
+  isConsultationPeerEntryDismissed,
+  isOnVideoCallScreen,
+  joinConsultationRoom,
+  markConsultationCallSeen,
 } from '../services/consultationChatPresence';
+import {startCallRinging, stopCallRinging, vibrateNotice} from '../services/callRinger';
 import {
   fetchAttorneyUpcomingAppointments,
   getCurrentSessionProfile,
@@ -25,6 +32,7 @@ const AUTH_ROUTE_NAMES = new Set([
 ]);
 
 const REFRESH_MS = 45000;
+const NAV_REFRESH_MIN_GAP_MS = 10000;
 
 function isWatchableClientRow(item) {
   const status = String(item?.status || '').toLowerCase();
@@ -57,38 +65,93 @@ function isWatchableAttorneyRow(item) {
   });
 }
 
+function isBusyWithAppointment(appointmentId) {
+  return (
+    getConsultationChatFocusedAppointmentId(navigationRef) === String(appointmentId) ||
+    isOnVideoCallScreen(navigationRef)
+  );
+}
+
+/**
+ * App-wide alerts while the user is outside the consultation chat: the other party
+ * entering the chatroom, and Messenger-style ringing when they start a video call.
+ */
 export default function ConsultationPeerEntryHost() {
   const [entryPopup, setEntryPopup] = useState(null);
-  const [navTick, setNavTick] = useState(0);
-  const detachByAppointmentRef = useRef({});
-  const watchTargetsRef = useRef([]);
-  const roleRef = useRef('client');
-  const userIdRef = useRef(null);
+  const [callPopup, setCallPopup] = useState(null);
+  const roomsRef = useRef({});
+  const notifiedRef = useRef(new Set());
+  const lastRefreshAtRef = useRef(0);
+  const callPopupRef = useRef(null);
+  callPopupRef.current = callPopup;
+  const entryPopupRef = useRef(null);
+  entryPopupRef.current = entryPopup;
 
-  useEffect(() => {
-    if (!navigationRef.isReady()) {
-      return undefined;
-    }
-    const unsubscribe = navigationRef.addListener('state', () => {
-      setNavTick(t => t + 1);
-    });
-    return unsubscribe;
+  const closeCallPopup = useCallback(() => {
+    stopCallRinging();
+    setCallPopup(null);
   }, []);
 
-  const isViewingChat = useCallback(
-    appointmentId =>
-      getConsultationChatFocusedAppointmentId(navigationRef) === String(appointmentId),
-    [navTick],
+  const handlePeerChange = useCallback(
+    (target, role, peer, prev) => {
+      const {appointmentId, otherPartyName} = target;
+      const otherRole = role === 'attorney' ? 'client' : 'attorney';
+
+      if (!peer.inCall && callPopupRef.current?.appointmentId === appointmentId) {
+        closeCallPopup();
+      }
+      if (isBusyWithAppointment(appointmentId)) {
+        return;
+      }
+
+      if (peer.inCall && peer.callStartedAt) {
+        if (!isConsultationCallSeen(appointmentId, peer.callStartedAt)) {
+          markConsultationCallSeen(appointmentId, peer.callStartedAt);
+          setEntryPopup(null);
+          setCallPopup({
+            ...buildConsultationIncomingCallCopy({otherRole, otherPartyName}),
+            appointmentId,
+            navigateParams: target.navigateParams,
+          });
+          startCallRinging(() => setCallPopup(null));
+        }
+        return;
+      }
+
+      const joinedNow =
+        peer.inChat && peer.joinedAt && (!prev || !prev.inChat || prev.joinedAt !== peer.joinedAt);
+      if (!joinedNow) return;
+      const joinKey = `join:${appointmentId}:${peer.joinedAt}`;
+      if (
+        notifiedRef.current.has(joinKey) ||
+        isConsultationPeerEntryDismissed(appointmentId, peer.joinedAt)
+      ) {
+        return;
+      }
+      notifiedRef.current.add(joinKey);
+      setEntryPopup({
+        ...buildConsultationWaitingCopy({otherRole, otherPartyName}),
+        appointmentId,
+        otherJoinedAt: peer.joinedAt,
+        navigateParams: target.navigateParams,
+      });
+      vibrateNotice();
+    },
+    [closeCallPopup],
   );
+
+  const detachAll = useCallback(() => {
+    Object.values(roomsRef.current).forEach(entry => entry.room.release());
+    roomsRef.current = {};
+  }, []);
 
   const refreshWatchers = useCallback(async () => {
     const routeName = navigationRef.getCurrentRoute?.()?.name;
     if (!routeName || AUTH_ROUTE_NAMES.has(routeName)) {
-      Object.values(detachByAppointmentRef.current).forEach(detach => detach());
-      detachByAppointmentRef.current = {};
-      watchTargetsRef.current = [];
+      detachAll();
       return;
     }
+    lastRefreshAtRef.current = Date.now();
 
     let profile;
     try {
@@ -103,8 +166,6 @@ export default function ConsultationPeerEntryHost() {
 
     const role =
       String(profile.role || '').toLowerCase() === 'attorney' ? 'attorney' : 'client';
-    roleRef.current = role;
-    userIdRef.current = profile.id;
 
     let targets = [];
     try {
@@ -157,37 +218,30 @@ export default function ConsultationPeerEntryHost() {
     }
 
     const nextIds = new Set(targets.map(t => t.appointmentId));
-    for (const [id, detach] of Object.entries(detachByAppointmentRef.current)) {
-      if (!nextIds.has(id)) {
-        detach();
-        delete detachByAppointmentRef.current[id];
+    for (const [id, entry] of Object.entries(roomsRef.current)) {
+      if (!nextIds.has(id) || entry.userId !== profile.id) {
+        entry.room.release();
+        delete roomsRef.current[id];
       }
     }
 
-    watchTargetsRef.current = targets;
-
     targets.forEach(target => {
-      if (detachByAppointmentRef.current[target.appointmentId]) {
+      const existing = roomsRef.current[target.appointmentId];
+      if (existing) {
+        existing.target = target;
         return;
       }
-      detachByAppointmentRef.current[target.appointmentId] = subscribeConsultationPeerEntry({
+      const entry = {target, userId: profile.id, room: null};
+      entry.room = joinConsultationRoom({
         appointmentId: target.appointmentId,
         role,
         userId: profile.id,
-        otherPartyName: target.otherPartyName,
-        isViewingChat: () => isViewingChat(target.appointmentId),
-        onPeerEntered: payload => {
-          if (isViewingChat(target.appointmentId)) {
-            return;
-          }
-          setEntryPopup({
-            ...payload,
-            navigateParams: target.navigateParams,
-          });
-        },
+        displayName: profile.full_name,
+        onPeerChange: (peer, prev) => handlePeerChange(entry.target, role, peer, prev),
       });
+      roomsRef.current[target.appointmentId] = entry;
     });
-  }, [isViewingChat]);
+  }, [detachAll, handlePeerChange]);
 
   useEffect(() => {
     refreshWatchers().catch(() => {});
@@ -199,13 +253,29 @@ export default function ConsultationPeerEntryHost() {
         refreshWatchers().catch(() => {});
       }
     });
+    const unsubscribeNav = navigationRef.addListener('state', () => {
+      const routeName = navigationRef.getCurrentRoute?.()?.name;
+      const popupAppointmentId = entryPopupRef.current?.appointmentId;
+      if (popupAppointmentId && isBusyWithAppointment(popupAppointmentId)) {
+        setEntryPopup(null);
+      }
+      if (!routeName || AUTH_ROUTE_NAMES.has(routeName)) {
+        detachAll();
+      } else if (
+        Object.keys(roomsRef.current).length === 0 &&
+        Date.now() - lastRefreshAtRef.current > NAV_REFRESH_MIN_GAP_MS
+      ) {
+        refreshWatchers().catch(() => {});
+      }
+    });
     return () => {
       clearInterval(interval);
       sub.remove();
-      Object.values(detachByAppointmentRef.current).forEach(detach => detach());
-      detachByAppointmentRef.current = {};
+      unsubscribeNav();
+      stopCallRinging();
+      detachAll();
     };
-  }, [refreshWatchers, navTick]);
+  }, [refreshWatchers, detachAll]);
 
   const handleNotNow = () => {
     if (entryPopup?.appointmentId) {
@@ -222,14 +292,42 @@ export default function ConsultationPeerEntryHost() {
     setEntryPopup(null);
   };
 
+  const handleDeclineCall = () => {
+    const appointmentId = callPopup?.appointmentId;
+    if (appointmentId) {
+      roomsRef.current[appointmentId]?.room.sendCallDeclined();
+    }
+    closeCallPopup();
+  };
+
+  const handleJoinCall = () => {
+    const target = callPopup?.navigateParams;
+    closeCallPopup();
+    if (target && navigationRef.isReady()) {
+      navigationRef.navigate(target.screen, {...target.params, joinCall: true});
+    }
+  };
+
   return (
-    <ConsultationWaitingPopup
-      visible={Boolean(entryPopup)}
-      title={entryPopup?.title}
-      body={entryPopup?.body}
-      showGoToChatroom
-      onNotNow={handleNotNow}
-      onGoToChatroom={handleGoToChatroom}
-    />
+    <>
+      <ConsultationWaitingPopup
+        visible={Boolean(entryPopup) && !callPopup}
+        title={entryPopup?.title}
+        body={entryPopup?.body}
+        showGoToChatroom
+        onNotNow={handleNotNow}
+        onGoToChatroom={handleGoToChatroom}
+      />
+      <ConsultationWaitingPopup
+        visible={Boolean(callPopup)}
+        title={callPopup?.title}
+        body={callPopup?.body}
+        showGoToChatroom
+        goToChatroomLabel="Join"
+        notNowLabel="Decline"
+        onNotNow={handleDeclineCall}
+        onGoToChatroom={handleJoinCall}
+      />
+    </>
   );
 }
